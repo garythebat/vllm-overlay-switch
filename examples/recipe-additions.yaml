@@ -1,0 +1,30 @@
+# What to add to a recipe of eugr/spark-vllm-docker to get the overlay switch.
+#
+# This is a fragment, not a recipe: merge the four marked items into the recipe you already
+# serve the BASE checkpoint with. Paths are placeholders. Not run as written; see the README
+# for what has and has not been tested.
+
+mods:
+  - mods/overlay-switch        # (1) a copy of this repository's mod/ folder inside your
+                               #     spark-vllm-docker checkout (or pass --apply-mod with a path)
+
+env:
+  # (2) VLLM_PLUGINS is an allow-list for every vLLM plugin, comma separated, no spaces.
+  #     Name the switch and everything the image already loads. The mod prints the exact
+  #     value for your image when it installs; the two after overlay_switch are vLLM's own.
+  VLLM_PLUGINS: "overlay_switch,lora_filesystem_resolver,lora_hf_hub_resolver"
+
+  # (3) The side file with the alternate tensors, as the container sees it. It must be
+  #     readable at this path on every machine of the cluster.
+  OVERLAY_SWITCH_FILE: "/root/.cache/huggingface/overlay/side.safetensors"
+
+  # Optional. Who may call the switch besides the machine the server runs on, and a shared
+  # secret that every call must then carry in the X-Overlay-Token header.
+  # OVERLAY_SWITCH_ALLOW: "192.0.2.10,192.0.2.11"
+  # OVERLAY_SWITCH_TOKEN: "choose-your-own"
+
+command: |
+  vllm serve /path/to/the/base/checkpoint \
+      --load-format b12x \
+      --worker-extension-cls vllm_overlay_switch.worker.OverlayWorkerExtension
+#     (4) the last line above; keep every other flag of your recipe as it is

@@ -1,7 +1,9 @@
 # Design
 
-Status: design from source reading. Nothing here has run on hardware yet. Every
-reference below is to the pinned commits listed in the README.
+Status: written from a reading of the engine source and tested off the hardware (see the
+table in the README). It has not run on a GPU yet. Every reference below is to the pinned
+commits listed in the README; `path:line` is in the vLLM fork unless it starts with
+`flashinfer/`.
 
 ## The problem in one paragraph
 
@@ -9,46 +11,62 @@ A weight overlay that replaces a few tensors can be loaded by remapping those te
 names in `model.safetensors.index.json` to a small side file. That gives a second
 checkpoint folder that shares every other file with the base. But a server can hold
 only one of the two at a time, and changing between them is a stop and a relaunch.
-The goal is one server that holds both versions of the few tensors and switches which
-one is active with a single call.
+The goal is one server that runs the base weights and can change the few tensors to
+the overlay's, and back, with a single call.
 
 ## What the engine does with these tensors
 
-References are `path:line` in the vLLM fork unless they start with `flashinfer/`.
-
 1. **Loading follows the index, per tensor name.** With `--load-format b12x` the loader
-   reads each tensor from the file the index names for it and skips other files that
-   also contain that name
+   reads each tensor from the file the index names for it
    (`vllm/model_executor/model_loader/b12x_loader.py:238-248`).
 
-2. **`wo_b` is an FP8 weight with native 32x32 block scales.** After loading, each
-   attention module packs its output projection once
-   (`vllm/models/deepseek_v4_1/attention.py:1596-1632`, `setup_wo_projection`), with
-   `block_size=(32, 32)`, and keeps the result in `self._wo_projection_weights`.
+2. **`wo_b` is a row-parallel layer holding FP8 values and native 32x32 block scales**
+   (`vllm/models/deepseek_v4_1/attention.py:533-542`,
+   `vllm/models/deepseek_v4_1/b12x_layers.py:304-343`): a `weight` of type
+   `float8_e4m3fn` and a `weight_scale_inv` of type `float8_e8m0fnu`.
 
-3. **Packing keeps the checkpoint bytes.** For 32x32 scales the kernel library never
-   requantizes; the packed `values` are `weight.contiguous()`, and two scale tables
-   (`scale_rows`, `scale_mma`) are derived from the block scales. A tiled copy of the
-   values exists only for one specific shape
-   (`flashinfer/experimental/b12x/gemm/_shared/wo_mxfp8.py:1447-1546`). `wo_a` and `wo_b`
-   are packed by two separate calls (`wo_mxfp8.py:1547-1586`), so `wo_b` can be handled
-   alone.
+3. **The checkpoint bytes are kept as they are.** The layer's weight method is wrapped
+   by one whose only job after loading is to check the two types; its own description
+   is "Keep checkpoint FP8 tensors unmodified for the fused WO projection"
+   (`attention.py:304-324`).
 
-4. **The forward pass reads the packed object on every call**
-   (`attention.py:1754`) and hands it to a fused kernel. That call sits inside captured
-   CUDA graphs, which is why the next point matters.
+4. **Each rank holds a slice of columns.** The loader cuts a row-parallel weight along
+   its input dimension: `local` columns per rank, starting at `rank * local`
+   (`vllm/model_executor/layers/linear.py:1867-1883`). When the number of heads was
+   padded to divide by the number of ranks, the last rank's tail is padding
+   (`vllm/model_executor/parameter.py:20-45`; the attribute is set at
+   `attention.py:543-548`). The block scales are cut the same way, in units of 32.
 
-5. **In place, never by replacement.** The engine's own reload code states the rule:
+5. **Packing happens once, after loading**
+   (`attention.py:1596-1632`, `setup_wo_projection`), with `block_size=(32, 32)`. The
+   result is kept in `self._wo_projection_weights`. For 32x32 scales nothing is
+   requantized: the packed `values` are `weight.contiguous()`, the Parameter's own
+   memory, and two scale tables (`scale_rows`, `scale_mma`) are new memory derived
+   from the block scales. For two specific shapes, one of them 4096 x 4096, there is
+   also `values_tiled`, a second, tiled copy of the values
+   (`flashinfer/experimental/b12x/gemm/_shared/wo_mxfp8.py:1447-1544`), which the decode
+   kernel reads when its plan asks for it
+   (`flashinfer/experimental/b12x/gemm/wo_projection/_preparation.py:503-504`). A file
+   weight of 4096 x 10240 reads as ten groups of rank 1024; padded to twelve groups over
+   three ranks, each rank's `wo_b` would be exactly that shape. This is worked out from
+   sizes, not yet read from a running model. `wo_a` and `wo_b` are packed by two
+   separate calls (`wo_mxfp8.py:1547-1585`), so `wo_b` can be handled alone.
+
+6. **The forward pass binds the packed object on every call**
+   (`attention.py:1754-1767`). The prepared plan holds scratch space for activations,
+   not weights (`wo_mxfp8.py:195-394`). The call sits inside captured CUDA graphs, which
+   is why the next point matters.
+
+7. **In place, never by replacement.** The engine's own reload code states the rule:
    "Copy processed values into original tensor storage (preserves cudagraph refs)"
    (`vllm/model_executor/model_loader/reload/layerwise.py:476`). A switch must overwrite
    the bytes of the existing buffers. Assigning a new tensor object would be seen by
    eager execution and missed by replayed graphs.
 
-6. **The prefix cache does not know about weights.** Block hashes are computed from
-   the parent hash, the token ids and a few request fields (LoRA name, multimodal
-   content, `cache_salt`, prompt embeds); see `vllm/v1/core/kv_cache_utils.py:618-666`.
-   After a flip, cached blocks computed with the other weights would be reused unless
-   the cache is cleared.
+8. **The prefix cache does not know about weights.** Block hashes are computed from
+   the parent hash, the token ids and a few request fields
+   (`vllm/v1/core/kv_cache_utils.py:618-666`). After a flip, cached blocks computed with
+   the other weights would be reused unless the cache is cleared.
 
 ## What does not work, and why
 
@@ -58,61 +76,125 @@ References are `path:line` in the vLLM fork unless they start with `flashinfer/`
   (`attention.py:1754-1767`). Two requests decoded together cannot use different sets.
 - **The built-in weight reload.** Under the b12x loader it raises "b12x requires an
   active initial-load session" (`b12x_loader.py:276-281`), and it would not rebuild the
-  derived scale tables.
+  derived tables.
 
-## The switch
+## How the switch gets into the engine without a patch
 
-At startup, on every tensor-parallel rank:
+- **The worker half** is a class given with `--worker-extension-cls`. The engine mixes
+  it into its worker class on every rank and logs the method names it gained
+  (`vllm/v1/worker/worker_base.py:366-392`). The names must not collide with the
+  worker's own; this one adds three (`overlay_status`, `overlay_prepare`,
+  `overlay_switch`).
+- **The HTTP half** is an endpoint plugin, found through the entry point group
+  `vllm.endpoint_plugins` and loaded only when `VLLM_PLUGINS` names it
+  (`vllm/plugins/__init__.py:93-121`). The same variable is the allow-list for the
+  engine's other plugin groups (`vllm/plugins/__init__.py:36-59`), so it must also name
+  whatever the image already loads.
+- **The calls it uses** are the engine client's own: `pause_generation`, described there
+  as "Pause generation to allow model weight updates", `resume_generation`, `is_paused`
+  (`vllm/v1/engine/async_llm.py:913-964`), `reset_prefix_cache` (`:1087`) and
+  `collective_rpc` (`:1142`), which runs one method on every rank. While paused, new
+  requests are not scheduled; they are flushed on resume (`vllm/v1/engine/core.py:1006`).
 
-1. Read the alternate tensors from the side file.
-2. Cut them down to this rank's shard exactly as the loader did for the base weights.
-3. Pack them with the same function the model uses for `wo_b`.
-4. Keep the packed alternate set, and a copy of the packed base set, next to the live
-   buffers. For the motivating case this is about 26 buffers of a few megabytes per
-   rank for each set.
+The engine also offers pause, resume and "run this method on every rank" as HTTP routes,
+but only behind its developer mode, which exposes much more than a switch needs on the
+public API port. This project does not enable developer mode.
 
-On a flip:
+## The worker half
 
-1. Pause generation and let running requests finish.
-2. On every rank, copy the chosen set into the live buffers in place: the values, the
-   two scale tables and the tiled copy if there is one.
-3. Check that every rank reports the same active set. If ranks disagree, copy the
-   previous set back; if that fails too, stay paused and say so.
-4. Clear the prefix cache.
-5. Resume.
+**Prepare** (once per rank, at the first flip):
 
-The served model name does not change. A status call reports which set is active.
+1. Read the side file's header. Every tensor must be a `layers.N.attn.wo_b` weight or
+   scale of the expected type, and every weight must come with its scale.
+2. Find the same tensors in the served checkpoint through its index. If the index
+   already points at the side file, stop: the server must be started on the base.
+3. For each tensor, work out which columns this rank holds (point 4 above) and check
+   rows, types and one-byte elements against the live Parameter.
+4. Read both sets from disk and fingerprint this rank's columns of every tensor.
+5. **Prove the cut**: fingerprint the same columns of every live tensor. They must all
+   match one set. If they match neither, this tool's reading of the layout does not fit
+   the engine in front of it; the rank stays unprepared and will not write, whatever it
+   is asked.
 
-## Control and exposure
+**Switch** (per rank):
 
-The engine has pause, resume, prefix cache reset and "run this method on every rank"
-calls, but only behind its developer mode, which exposes much more than a switch needs
-on the public API port. This project does not enable developer mode. It adds one narrow
-route for the flip and one for status, and by default accepts them from the local
-machine only.
+1. For every layer in order, for weight and scale: read the tensor from disk, keep this
+   rank's columns, copy them over the live Parameter's memory. Padding columns are
+   never read or written.
+2. Rebuild the derived tensors with the model's own packing function and copy each over
+   the existing one where it is not the Parameter's memory already; check that each
+   took the copy.
+3. Read every switched tensor back and compare with both sets.
+
+All copies are made on the bytes (through `uint8` views), so nothing depends on which
+operations the installed torch offers for the two 8-bit float types. The writes run
+inside `torch.inference_mode()`, because tensors made at load time may be inference
+tensors.
+
+**Status** reads the first and last switched layer back. A write goes through the
+layers in order, so one that stopped halfway leaves those two disagreeing. `?full=1`
+reads every tensor.
+
+Which set is active is read from the weights, never remembered.
+
+## The HTTP half
+
+`POST /overlay/switch`:
+
+1. Ask every rank for its status; prepare if any rank is unprepared.
+2. If the ranks do not agree on one set, stop, unless `force` was sent.
+3. If the wanted set is already active, answer without pausing.
+4. Pause in the chosen mode, with the cache cleared.
+5. Switch on every rank. If every rank reports the wanted set: clear the prefix cache,
+   resume, answer.
+6. Otherwise copy the previous set back on every rank. If that works: clear, resume,
+   answer with the error. If it does not, or there was no known previous set: leave
+   generation paused and say so.
+
+One flip at a time; a second call meanwhile gets 409.
+
+A call that times out does not cancel what the ranks were asked to do: the request stays
+queued on the workers and still runs. Since the copy back is queued behind it, the end
+state is still the previous set. What the engine does with late answers was not traced.
+
+## Memory and time
+
+For the motivating case, if each rank's `wo_b` is 4096 x 4096 as worked out above, a rank
+writes 26 weights of 16.8 MB (437 MB in all) and 26 small scale tensors. Nothing is kept
+between flips. During a flip one file tensor (42 MB) and one cut (16.8 MB) are held on
+the CPU side, and the packing function allocates a few tens of megabytes on the device,
+which are released at the end. Preparing reads both sets once, about 2.2 GB of file
+reads per rank.
+
+These sizes are worked out from the file and the shapes in the source, not measured.
+Flip time has not been measured either.
 
 ## Acceptance test
 
-The test asks nothing sensitive and needs no reference answers. It uses the fact that
-two models with different weights choose different next tokens at some point where both
-have read exactly the same words, and that each model repeats its own choice.
+`tools/acceptance.py`. It asks nothing sensitive and needs no reference answers. It
+uses the fact that two models with different weights choose different next tokens at
+some point where both have read exactly the same words, and that each model repeats its
+own choice.
 
 1. Ask a handful of plain prompts at temperature 0 with thinking off, twice, recording
-   the tokens and their log probabilities.
+   the tokens.
 2. Flip. Ask again, twice. Flip back. Ask again, twice.
 3. For each prompt, walk the answers token by token while they all agree. At the first
-   point of disagreement, both runs on the base set must agree with each other, both
-   runs on the alternate set must agree with each other, and the two sets must differ.
-4. After flipping back, the choices must be the base set's again.
+   point of disagreement, all answers on the first set must agree with each other, both
+   answers on the other set must agree with each other, and the two sets must differ.
+4. After flipping back, the choices must be the first set's again.
 
 Two identical requests to the same model do not return identical numbers on this kind
 of deployment, and wording can drift after a few tokens. That is why the test compares
-choices at identical contexts and each model against its own repeat, not raw numbers.
+choices at identical contexts and each set against its own repeat, not raw numbers.
 
 ## Open questions, to be settled by running it
 
 - Do captured graphs follow an in-place overwrite here, as the reload code implies?
-- The exact per-rank tensor shapes under tensor parallelism, including padded groups
-  (`vllm/model_executor/models/config.py:503-513`).
-- Flip latency and the extra memory actually held.
-- Whether any other component keeps its own copy of these weights.
+  The acceptance test answers this.
+- Does anything else keep its own copy of these weights? None was found in the reading;
+  the acceptance test would show it.
+- How long does a flip take?
+- Does the installed image register plugins beyond vLLM's own two, which `VLLM_PLUGINS`
+  would have to name? The installer prints what it finds.
+- Worker and queue state after a `collective_rpc` timeout.

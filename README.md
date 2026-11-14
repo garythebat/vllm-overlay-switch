@@ -16,38 +16,137 @@ base weights and can be flipped to the overlay, and back, with one call.
 
 ## Status
 
-**Design only. Nothing in this repository has run on hardware yet.**
+**Written, and tested off the hardware. It has not yet run on a GPU or inside the real
+engine.** Treat it as unproven until the acceptance test below has passed on your setup.
 
-What is established, by reading the engine source at the exact commits listed under
-Scope (file and line references are in [docs/design.md](docs/design.md)):
+| Part | How it has been checked |
+|---|---|
+| The order of a flip, putting things back when a rank fails, the forced way out, who may call | unit tests with a stand-in engine (`tests/test_logic.py`) |
+| The HTTP routes | unit tests with FastAPI's test client and a stand-in engine (`tests/test_api.py`) |
+| Reading tensors out of safetensors files | unit tests on hand-made files (`tests/test_stfile.py`) |
+| The worker half: which columns a rank holds, overwriting in place, reading back, leaving padding alone, refusing what it does not understand | unit tests with real torch tensors (torch 2.13.0, the engine image's version, CPU build), real files, three simulated ranks, and stand-ins for the engine's modules (`tests/test_worker.py`) |
+| That the code fits the engine | read against the engine source at the commits listed under Scope; references in [docs/design.md](docs/design.md) |
+| The installer `mod/run.sh` | dry run against a folder laid out like the image's package folder: install, install again, two refusals. Not yet run inside an image |
+| The acceptance tool itself | run against a stand-in server whose behaviour is known: a pass, both failure verdicts, and "cannot tell" (`tests/test_acceptance.py`) |
+| A flip on a GPU, under captured CUDA graphs, across machines | **not run.** This is what `tools/acceptance.py` is for |
 
-- The overlay tensors are held as plain GPU buffers. For this model's native 32x32
-  block scales the kernel library uses the checkpoint bytes as they are, plus two small
-  scale tables derived from them. Nothing is baked into compiled kernels.
-- `wo_b` is packed separately from `wo_a`, so only `wo_b` has to be touched.
-- The engine's own reload code states the rule a switch must follow: copy new bytes
-  into the existing tensor storage, so that captured CUDA graphs keep pointing at valid
-  memory. Replacing the tensor object instead would leave replayed graphs on the old one.
-- The prefix cache is keyed by tokens and a few request fields, not by the weights, so
-  it has to be cleared on every flip.
-- LoRA cannot do this job for this model (the model refuses LoRA adapters), a choice
-  per request is not possible (the fused kernel takes one set of weights per batch),
-  and the built-in weight reload refuses to run under the loader this model uses.
+## How it works
 
-What is not established until it runs:
+No engine file is edited. Two small pieces are added through extension points the
+engine already has:
 
-- that captured graphs really follow an in-place overwrite in this engine,
-- the exact tensor shapes per rank under tensor parallelism,
-- how long a flip takes and how much extra memory it holds.
+- **On every machine**, a worker extension (`--worker-extension-cls`) that can overwrite
+  the live weight buffers of the switched tensors with one set or the other.
+- **On the API server**, an endpoint plugin with two routes: status and switch.
 
-What was measured before any of this, on stock serving: an index-remapped overlay is
-picked up by the loader and changes the model's next-token choices at identical
-contexts, repeatably. The same measurement is the acceptance test for the switch (see
-[docs/design.md](docs/design.md), "Acceptance test").
+A flip:
+
+1. Pauses generation. Requests that are running finish first; requests that arrive
+   meanwhile are queued by the engine.
+2. On every machine, reads the chosen set from disk, keeps the columns that machine
+   holds, and copies them over the existing buffers. Then it rebuilds the small tables the
+   model derived from these weights at startup and copies those over the existing ones
+   too. Nothing is replaced, only overwritten, because captured CUDA graphs hold the
+   addresses of these buffers.
+3. Reads every switched tensor back from the device and compares it with both sets.
+4. If the machines do not all report the wanted set, copies the previous set back. If
+   that fails as well, generation stays paused and the answer says so: a model whose
+   machines hold different weights must not answer anyone.
+5. Clears the prefix cache (it does not know about weights) and resumes.
+
+Before its first flip, every machine proves its own reading of the files against the
+live model: it must find the live weights to be exactly the base set, tensor by tensor.
+If this tool's idea of which columns a machine holds did not fit the engine in front of
+it, that proof fails and nothing is ever written.
+
+Nothing is held in memory between flips. The price is that a flip reads the switched
+tensors from disk each time (about a gigabyte per machine for the case above).
+
+## Install
+
+The server must be started on the **base** checkpoint. The alternate tensors come from
+a **side file**: a safetensors file holding `layers.N.attn.wo_b.weight` (F8_E4M3) and
+`layers.N.attn.wo_b.scale` (F8_E8M0) under exactly those names, with the base
+checkpoint's shapes. This is the same kind of file an index-remapped overlay folder
+points at. It must be readable at the same path inside the container on every machine.
+
+With [spark-vllm-docker](https://github.com/eugr/spark-vllm-docker):
+
+1. Copy this repository's `mod/` folder into your checkout as `mods/overlay-switch`.
+2. Merge the four items of [examples/recipe-additions.yaml](examples/recipe-additions.yaml)
+   into your recipe: the mod, `VLLM_PLUGINS`, `OVERLAY_SWITCH_FILE`, and
+   `--worker-extension-cls vllm_overlay_switch.worker.OverlayWorkerExtension`.
+3. Launch as usual. The mod prints the exact `VLLM_PLUGINS` value for your image; that
+   variable is an allow-list for every vLLM plugin, so it has to name the ones the image
+   already loads as well. In the server log, look for
+   `Injected ... OverlayWorkerExtension ... for extended collective_rpc calls`.
+
+Without the mods mechanism, `pip install .` inside the image does the same as the mod.
+
+## Use
+
+By default the routes answer only to the machine the server runs on.
+
+```sh
+# which set is live (add ?full=1 to read every tensor back, not just the first and last layer)
+curl -s http://127.0.0.1:8000/overlay/status
+
+# flip to the overlay, and back
+curl -s -X POST http://127.0.0.1:8000/overlay/switch -H 'Content-Type: application/json' -d '{"variant": "overlay"}'
+curl -s -X POST http://127.0.0.1:8000/overlay/switch -H 'Content-Type: application/json' -d '{"variant": "base"}'
+```
+
+- The first flip also prepares: every machine reads both sets once and proves its cut.
+- `"mode": "wait"` (the default) lets running requests finish before the copy;
+  `"mode": "abort"` ends them.
+- The served model name does not change. Nothing tells a client which set answered,
+  except the status route.
+- If a flip leaves generation paused, `{"variant": "base", "force": true}` writes that
+  set onto every machine whatever is there, and resumes only if they then all agree.
+  `force` cannot make a machine write that never proved its cut.
+- To let other addresses call the switch, set `OVERLAY_SWITCH_ALLOW` to a comma
+  separated list. If `OVERLAY_SWITCH_TOKEN` is set, every call must carry it in the
+  `X-Overlay-Token` header. These routes are outside the paths the engine's own API key
+  guards.
+
+## Acceptance test
+
+```sh
+python3 tools/acceptance.py http://127.0.0.1:8000 MODEL_NAME --out report.json
+```
+
+It asks a few plain prompts at temperature 0 on the live set, flips, asks again, flips
+back and asks again, and compares the next-token choices at the first place the
+answers part, where every answer was produced from an identical context. It passes when
+the two sets choose differently there, each repeatably, and the choices after flipping
+back are the first ones again. It needs no reference answers and asks nothing
+sensitive. Details and the reasoning are at the top of the file.
+
+## Limits
+
+- One engine build (see Scope), one model path (DeepSeek V4.1, native kernels), one
+  kind of tensor (`attn.wo_b` weight and scale). Anything else in the side file is
+  refused.
+- One set for everyone. A flip changes the model for all requests; a choice per request
+  is not possible with this kernel (one set of weights per batch).
+- The switched tensors are read from disk at every flip.
+- Layers that belong only to a speculative-decoding draft model are not switched.
+
+## Tests
+
+```sh
+python3 -m unittest discover -s tests -v
+```
+
+`tests/test_worker.py` needs torch and numpy, `tests/test_api.py` needs fastapi and
+httpx; each is skipped when its packages are missing. The rest needs only the
+standard library. Nothing needs a GPU.
 
 ## Scope
 
-The patch is pinned. It targets one engine build and refuses to apply to anything else.
+Written against one engine build. The installer checks that the pieces it stands on
+exist and refuses otherwise; the worker refuses at run time if the live model does not
+look as expected.
 
 | Part | Source | Commit |
 |---|---|---|
@@ -56,7 +155,7 @@ The patch is pinned. It targets one engine build and refuses to apply to anythin
 | Packaging | github.com/eugr/spark-vllm-docker (the B12X image and its mods mechanism) | `a4c1729` |
 
 Model path covered: DeepSeek V4.1 on NVIDIA through `vllm/models/deepseek_v4_1`.
-Hardware it was designed on: three NVIDIA DGX Spark machines, tensor parallel 3.
+Hardware it was designed for: three NVIDIA DGX Spark machines, tensor parallel 3.
 
 ## Credits
 
