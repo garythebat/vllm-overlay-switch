@@ -20,7 +20,9 @@ done
 [ -f tools/build_catalog.py ] && { python3 tools/build_catalog.py --check || rc=1; }
 [ -f tools/check_links.py ] && { python3 tools/check_links.py || rc=1; }
 [ -f tools/check_licences.py ] && { python3 tools/check_licences.py || rc=1; }
+# The licence lint starts once a licence has been chosen (a LICENSES folder exists). Until then the README says
+# that all rights are reserved, and there is nothing for the lint to check against.
 REUSE=$(command -v reuse || true); [ -z "$REUSE" ] && [ -x "$HOME/.venvs/reuse/bin/reuse" ] && REUSE="$HOME/.venvs/reuse/bin/reuse"
-if [ -n "$REUSE" ]; then "$REUSE" lint -q || { "$REUSE" lint | tail -20; rc=1; }; fi
+if [ -n "$REUSE" ] && [ -d LICENSES ]; then "$REUSE" lint -q || { "$REUSE" lint | tail -20; rc=1; }; fi
 [ "$rc" = 0 ] || echo "pre-push: refused"
 exit $rc
