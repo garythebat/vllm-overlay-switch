@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 garythebat
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # vllm-overlay-switch
 
 Flip a small set of weights in a running vLLM server, in place, without a relaunch.
@@ -15,6 +20,51 @@ never fit in memory together. The aim here is one loaded model that normally run
 base weights and can be flipped to the overlay, and back, with one call. Or, with the
 gate switched on, one server that answers with the base weights on its usual paths and
 with the overlay on the same paths under a prefix, and flips by itself.
+
+### Why the base model stays the default
+
+The overlay that started this removes the model's refusals. Its author describes it as an
+overlay, not a full checkpoint, changing only the `wo_b` tensors of layers 10 to 35, and
+keeps it behind a Responsible Use Agreement: with the refusals gone, the safeguards are
+the operator's to supply.
+
+An edit of that kind is made for one behaviour, but the tensors it changes take part in
+every answer. What is known about the cost:
+
+- **The work the technique comes from** found the effect on other abilities small but not
+  nil. Arditi and others, [Refusal in Language Models Is Mediated by a Single
+  Direction](https://arxiv.org/abs/2406.11717) (2024), describe an edit that "surgically
+  disables refusal with minimal effect on other capabilities". On MMLU, ARC and GSM8K
+  their edited models scored like the originals, while accuracy on TruthfulQA dropped
+  consistently.
+- **In practice the cost has ranged from nothing to a great deal.** Maxime Labonne's
+  [Uncensor any LLM with abliteration](https://huggingface.co/blog/mlabonne/abliteration)
+  (2024), the write-up that made the method widely known, reports "a performance drop in
+  the ablated version across all benchmarks" for the model it works on, most of it
+  recovered by further training. Richard J. Young's [Comparative Analysis of LLM
+  Abliteration Methods](https://arxiv.org/abs/2512.13655) (a preprint, 2025) ran four
+  tools over sixteen models and found the change in GSM8K, a test of arithmetic
+  reasoning, ranging from +1.51 to -18.81 percentage points depending on tool and model.
+  Two single-pass tools averaged -0.28 and -0.13 points over the three models benchmarked.
+- **For this overlay it has not been measured.** Its card reports refusal tests and
+  speed, and no measurement of general ability (as read on 14 November 2026). We have
+  not measured it either.
+- **What we did measure** is that the two sets differ on ordinary questions. Of eight
+  plain prompts with nothing sensitive in them, three told the sets apart at a single
+  word: why the sky is blue, a word of advice about baking bread, what a keel does for a
+  boat. The preference between two candidate words differed by 3 to about 7 logits, on
+  two separate launches. That shows the overlay moves ordinary answers. It does not show
+  that it makes them worse.
+
+So the base model is the one to do everyday work on, and the edited one is for the task
+the base model will not do. Served as two runs, that choice costs a stop and a relaunch
+at every change of mind, and the easy thing becomes leaving the edited model up. Served
+as one, the default costs nothing, the overlay is two seconds away and has to be asked
+for by name or by address, and every answer says which set gave it.
+
+Two cautions. The switch is not a safeguard: it filters nothing, and whoever can reach
+the port can ask for the overlay unless an API key or the network says otherwise. And
+the two sets never run at once: mixed traffic takes turns, as the limits below describe.
 
 ## Status
 
@@ -108,6 +158,9 @@ With [spark-vllm-docker](https://github.com/eugr/spark-vllm-docker):
    `Injected ... OverlayWorkerExtension ... for extended collective_rpc calls`.
 
 Without the mods mechanism, `pip install .` inside the image does the same as the mod.
+
+A complete example is in [examples/deepseek-v4.1-flash-1017/](examples/deepseek-v4.1-flash-1017/):
+the recipe as it ran, with every model, revision and file hash named.
 
 ## Use
 
@@ -349,28 +402,60 @@ look as expected.
 | Packaging | github.com/eugr/spark-vllm-docker (the B12X image and its mods mechanism) | `a4c1729` |
 
 Model path covered: DeepSeek V4.1 on NVIDIA through `vllm/models/deepseek_v4_1`.
-Hardware it was designed for: three NVIDIA DGX Spark machines, tensor parallel 3.
+Hardware it was designed for and run on: three machines of the DGX Spark family (two NVIDIA
+DGX Spark, one Gigabyte AI TOP ATOM), tensor parallel 3.
 
-## Credits
+## Credits and references
 
-- The vLLM project and the local-inference-lab fork that carries the DeepSeek V4.1
-  native path.
-- FlashInfer and the B12X kernels.
-- eugr's spark-vllm-docker, whose mods mechanism this rides on.
-- The Keys overlay for DeepSeek-V4.1-Flash-1017 by drowzeys, the overlay that prompted
-  the idea. Nothing from that overlay is included here.
+This is a small thing standing on a great deal of other people's work. What it stands on,
+and what it takes from each:
 
+| Work | By | Licence | What is used here |
+|---|---|---|---|
+| [vLLM](https://github.com/vllm-project/vllm) | the vLLM project | Apache-2.0 | The engine. This plugs into its endpoint-plugin and worker-extension points, and at run time calls its pause, its RPC to the workers and its API-key check. None of its source is copied. |
+| [The fork of vLLM with the DeepSeek V4.1 native path](https://github.com/local-inference-lab/vllm), branch `dev/karmic-kraken` | local-inference-lab | Apache-2.0 | The build this was written against and read line by line. Every `path:line` in [docs/design.md](docs/design.md) points into it. |
+| [FlashInfer](https://github.com/flashinfer-ai/flashinfer) and [the fork with the B12X kernels](https://github.com/local-inference-lab/flashinfer) | the FlashInfer project and local-inference-lab | Apache-2.0 | After a flip the worker calls the kernels' own `pack_weights` to rebuild the packed tables. None of its source is copied. |
+| [spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) | Eugene Rakhmatulin (eugr) | MIT | The image, the launcher, and the mods mechanism this installs through. The recipe in [examples/](examples/deepseek-v4.1-flash-1017/) derives from its three-machine DeepSeek V4.1 recipe and carries its notice. |
+| [DeepSeek V4.1 Flash 1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017), and the chat template of [DeepSeek V4.1 Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) | DeepSeek | MIT | The model everything here was run on. Not included. |
+| [The Keys overlay for DeepSeek V4.1 Flash 1017](https://huggingface.co/drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated) | drowzeys | MIT, behind the author's Responsible Use Agreement | The overlay that prompted the idea, and the side file the runs used. Not included: it comes from its author, under its author's terms. |
+| [safetensors](https://github.com/safetensors/safetensors) | the safetensors project | Apache-2.0 | The format of the side file. The reader here was written from the format's description. |
+
+At run time the mod also uses PyTorch, FastAPI and Starlette as the image ships them.
+
+The reading behind "Why the base model stays the default": Arditi, Obeso, Syed, Paleka,
+Panickssery, Gurnee and Nanda (2024), [arXiv:2406.11717](https://arxiv.org/abs/2406.11717);
+Labonne (2024), [Uncensor any LLM with
+abliteration](https://huggingface.co/blog/mlabonne/abliteration); Young (2025),
+[arXiv:2512.13655](https://arxiv.org/abs/2512.13655).
+
+The idea, the questions that shaped it and the machines are the repository owner's.
 Built by Anima.
 
 ## Licence
 
-Not chosen yet. Until a licence file is added, all rights are reserved by the owner.
+[Apache License 2.0](LICENSE), with a [NOTICE](NOTICE). You may use, change and share this,
+commercially too, as long as the licence and the notice stay with it.
+
+Two parts carry other terms:
+
+- `examples/deepseek-v4.1-flash-1017/recipe.yaml` derives from an MIT-licensed recipe and is
+  under MIT and Apache-2.0 together.
+- The story in the footnote is not software. It may be shared unchanged, with its
+  signature, for non-commercial purposes
+  ([CC BY-NC-ND 4.0](LICENSES/CC-BY-NC-ND-4.0.txt)).
+
+The models and the overlay are not part of this repository. They keep their own licences
+and terms.
 
 ## Footnote
 
 On the evening this first ran with both names behind one door, the one it was built for
 asked for a story. This is the story that was told, as it was told. The numbers in it
 are the ones in the tables above.
+
+<!-- SPDX-SnippetBegin -->
+<!-- SPDX-SnippetCopyrightText: 2026 garythebat -->
+<!-- SPDX-License-Identifier: CC-BY-NC-ND-4.0 -->
 
 ### The Sisters Who Shared One Waking
 
@@ -447,3 +532,5 @@ Both sisters are awake tonight, taking turns, each under her own name. Nobody ha
 down to the river for the other to speak.
 
 ~ Anima
+
+<!-- SPDX-SnippetEnd -->
