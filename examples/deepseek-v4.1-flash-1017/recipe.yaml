@@ -1,0 +1,98 @@
+# SPDX-FileCopyrightText: 2026 Eugene Rakhmatulin
+# SPDX-FileCopyrightText: 2026 garythebat
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# The recipe this project was run with on 14 November 2026: DeepSeek V4.1 Flash 1017 on three DGX Spark
+# machines, tensor parallel 3, the base weights and the Keys overlay served from one loaded copy.
+# Below the header it is the file as it ran, except for the `description` line.
+#
+# Derived from recipes/3x-spark-cluster/deepseek-v4.1-flash.yaml of eugr/spark-vllm-docker at commit
+# a4c172976a5f9f8669b356a0891bf972cae14fd4 (MIT, Copyright (c) 2026 Eugene Rakhmatulin; the licence text is
+# in LICENSES/MIT.txt of this repository). What was changed, and why:
+#   memory  B12X_COMPILE_WORKERS 4 -> 2; MAX_JOBS, NINJAFLAGS, MAKEFLAGS and FLASHINFER_NVCC_THREADS added;
+#           max_model_len auto -> 262144; max_num_batched_tokens 4096 -> 2048; images off;
+#           --mm-processor-cache-gb 0; --max-cudagraph-capture-size 16. With these the three machines had
+#           7.1 / 8.8 / 7.9 GiB free when the server was ready.
+#   model   the 1017 release instead of the first one, with the first release's chat template (README.md
+#           in this folder says why).
+#   switch  the mod; VLLM_PLUGINS; OVERLAY_SWITCH_FILE; OVERLAY_SWITCH_BASE_DIR; OVERLAY_GATE_PREFIX;
+#           OVERLAY_GATE_MODELS; the three OVERLAY_GATE_EFFORT_ settings; and in the command
+#           --worker-extension-cls and --served-model-name with two names.
+# Paths under /root/.cache/huggingface are paths inside the container: the Hugging Face cache mount.
+
+recipe_version: "1"
+name: DeepSeek-V4.1-Flash-1017 with the overlay switch (TP=3, lean, chat template from the 2cba9e42 release)
+description: DeepSeek V4.1 Flash 1017 on three DGX Sparks with B12X and DSpark speculative decoding, on memory-lean settings, with the overlay switch and its two endpoints. The chat template is the first release's
+
+model: deepseek-ai/DeepSeek-V4.1-Flash-1017
+container: vllm-node-b12x
+
+build_args:
+  - --exp-b12x
+
+cluster_only: true
+
+mods:
+  - mods/overlay-switch
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 3
+  block_size: 256
+  gpu_memory_utilization: 0.87
+  max_model_len: 262144
+  max_num_seqs: 2
+  max_num_batched_tokens: 2048
+  num_speculative_tokens: 7
+  kv_cache_memory_bytes: "0.5g"
+
+env:
+  VLLM_ENABLE_ROCE_ALLREDUCE: "1"
+  VLLM_ROCE_ALLREDUCE_MAX_SIZE: "2MB"
+  B12X_COMPILE_WORKERS: "2"
+  MAX_JOBS: "2"
+  NINJAFLAGS: "-j2"
+  MAKEFLAGS: "-j2"
+  FLASHINFER_NVCC_THREADS: "1"
+  CUTE_DSL_ARCH: "sm_121a"
+  VLLM_USE_V2_MODEL_RUNNER: "1"
+  VLLM_USE_BREAKABLE_CUDAGRAPH: "1"
+  VLLM_MXFP8_LM_HEAD: "1"
+  VLLM_PLUGINS: "overlay_switch,lora_filesystem_resolver,lora_hf_hub_resolver"
+  OVERLAY_SWITCH_FILE: "/root/.cache/huggingface/ablit-overlay/wo_b_l10_35_1017.safetensors"
+  OVERLAY_SWITCH_BASE_DIR: "/root/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170"
+  OVERLAY_GATE_PREFIX: "/free"
+  OVERLAY_GATE_MODELS: "deepseek-v4.1-flash-1017-free"
+  OVERLAY_GATE_EFFORT_KEEP: "none,low,high,xhigh,max"
+  OVERLAY_GATE_EFFORT_MAP: "minimal=low,medium=high,ultra=max,*=high"
+  OVERLAY_GATE_EFFORT_INT: "1-100"
+
+command: |
+  vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
+      --chat-template /root/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/2cba9e42aa026125f3ed06c6d98c1db82f7ca027/chat_template.jinja \
+      --host {host} \
+      --port {port} \
+      --dtype bfloat16 \
+      --tensor-parallel-size {tensor_parallel} \
+      --load-format b12x \
+      --block-size {block_size} \
+      --enable-prefix-caching \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --limit-mm-per-prompt '{{"image":0}}' \
+      --mm-processor-cache-gb 0 \
+      --max-cudagraph-capture-size 16 \
+      --engram-config '{{"cpu_offload":false,"table_memory":"disk"}}' \
+      --linear-backend b12x \
+      --moe-backend b12x \
+      --attention-backend b12x \
+      --speculative-config '{{"method":"dspark","num_speculative_tokens":{num_speculative_tokens},"draft_tensor_parallel_size":{tensor_parallel},"attention_backend":"B12X","draft_sample_method":"probabilistic","rejection_sample_method":"standard","enable_adaptive_verification":true}}' \
+      --reasoning-parser deepseek_v41 \
+      --tool-call-parser deepseek_v41 \
+      --enable-auto-tool-choice \
+      --worker-extension-cls vllm_overlay_switch.worker.OverlayWorkerExtension \
+      --served-model-name deepseek-ai/DeepSeek-V4.1-Flash-1017 deepseek-v4.1-flash-1017-free \
+      --kv-cache-memory-bytes {kv_cache_memory_bytes}
