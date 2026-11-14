@@ -12,7 +12,9 @@ about 1.1 GB, out of a checkpoint of roughly 475 GB (the attention output projec
 Serving the base model and such an overlay as two separate runs means a stop and a
 relaunch every time you change your mind, several minutes each way, and two copies
 never fit in memory together. The aim here is one loaded model that normally runs the
-base weights and can be flipped to the overlay, and back, with one call.
+base weights and can be flipped to the overlay, and back, with one call. Or, with the
+gate switched on, one server that answers with the base weights on its usual paths and
+with the overlay on the same paths under a prefix, and flips by itself.
 
 ## Status
 
@@ -34,7 +36,9 @@ unproven on any other setup until the acceptance test below has passed on yours.
 | That the model reads what a flip wrote | six independent passes per set: five of eight prompts told the two sets apart (every margin of one set on one side, every margin of the other on the other) |
 | That the flipped state is the overlay model | the overlay was also loaded as a model of its own and read with `--read-only`. Wherever base and flipped stood apart, it lay on the flipped side with nearly the same medians, and at none of 34 positions did it stand apart from the flipped state |
 | Memory | six flips in a row left free memory where it was |
-| Not tested | a flip while requests are in flight or under load from several clients; other tensor-parallel sizes; finding the checkpoint by its served name on hardware (the test setup named the folder with `OVERLAY_SWITCH_BASE_DIR`) |
+| The gate (two endpoints on one server): who is let in when, the line, a failed or interrupted flip, what passes and what is refused, the API key under the prefix | unit tests with a stand-in engine and a stand-in server that records what the engine held while each request ran (`tests/test_gate.py`), and through FastAPI as the plugin installs it (`tests/test_api.py`). 31 faults made on purpose in the gate and its acceptance tool were each caught by a test. **Not run on hardware yet** |
+| The gate's acceptance tool | run against a stand-in server that can go wrong in each way the tool exists to catch (`tests/test_gate_acceptance.py`). Its rule for reading an answer was set after replaying real readings through it: see "Acceptance test" |
+| Not tested | the manual switch while requests are in flight or under load from several clients; the API-key check under the prefix on a real server (the stand-in copies the engine's rule); other tensor-parallel sizes; finding the checkpoint by its served name on hardware (the test setup named the folder with `OVERLAY_SWITCH_BASE_DIR`) |
 
 ## How it works
 
@@ -85,7 +89,8 @@ With [spark-vllm-docker](https://github.com/eugr/spark-vllm-docker):
 1. Copy this repository's `mod/` folder into your checkout as `mods/overlay-switch`.
 2. Merge the four items of [examples/recipe-additions.yaml](examples/recipe-additions.yaml)
    into your recipe: the mod, `VLLM_PLUGINS`, `OVERLAY_SWITCH_FILE`, and
-   `--worker-extension-cls vllm_overlay_switch.worker.OverlayWorkerExtension`.
+   `--worker-extension-cls vllm_overlay_switch.worker.OverlayWorkerExtension`. A fifth,
+   `OVERLAY_GATE_PREFIX`, turns on the two endpoints described below.
 3. Launch as usual. The mod prints the exact `VLLM_PLUGINS` value for your image; that
    variable is an allow-list for every vLLM plugin, so it has to name the ones the image
    already loads as well. In the server log, look for
@@ -119,6 +124,62 @@ curl -s -X POST http://127.0.0.1:8000/overlay/switch -H 'Content-Type: applicati
   `X-Overlay-Token` header. These routes are outside the paths the engine's own API key
   guards.
 
+## Two endpoints on one server
+
+Set `OVERLAY_GATE_PREFIX=/free` in the launch and the one loaded model answers on two
+sets of paths:
+
+| Base URL for a client | Answers with |
+|---|---|
+| `http://HOST:8000/v1` | the base set |
+| `http://HOST:8000/free/v1` | the overlay |
+
+A client picks a side by the base URL it is given and needs nothing else. The served
+model name is the same on both. Every answer of a request that ran the model carries a
+header, `x-overlay-side: base` or `overlay`.
+
+What the gate does:
+
+- Requests for the side that is live are let in as they come and run together, as
+  without the gate.
+- The first request for the other side waits until the requests in flight have ended.
+  Then the server flips (the same flip as above) and that request runs. Requests that
+  arrive behind it wait their turn in order, whichever side they are for, so neither
+  side can starve the other.
+- A request is never handed to the engine while its side is not live. The two sets never
+  answer in the same instant: the kernel takes one set of weights for everything it
+  decodes together.
+- Each side keeps its own cached prefixes. The gate marks every request with a cache
+  salt that names its side (a client's own `cache_salt` is kept, as a digest behind the
+  side), so nothing computed with one set is reused with the other, and a flip does not
+  clear the cache. Coming back to a long conversation on either side does not mean
+  reading it again, as long as the cache has room for both.
+
+What it costs: a change of side waits for the requests in flight and then takes one flip
+(1.4 to 2.0 s on the setup above). Two clients that take turns, one on each side, pay
+that on every request.
+
+What it refuses, so that nothing can run the model behind its back:
+
+- Any route it does not know. Let through are `GET` requests, `/tokenize`,
+  `/detokenize`, and the four routes that run the model and take a cache salt:
+  `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`.
+  Embeddings, scoring, the realtime websocket and the rest answer 403 or are closed.
+- A request that asks to be run in the background (`"background": true` on
+  `/v1/responses`): the model would run after the gate had let it go.
+- A flip by hand. `POST /overlay/switch` then only takes `"force": true`, the way out
+  after a flip that failed. If a flip leaves the machines in an unclear state, the gate
+  answers 503 to everyone until that forced flip has put one set on all of them.
+
+The server's API key. The engine checks its key by how a path begins (`/v1` and a few
+more), and `/free/v1/...` does not begin that way. The gate therefore runs the engine's
+own key check again for everything under the prefix, with the same keys. If the server
+has a key and the engine's check cannot be found, the server does not start.
+
+`GET /overlay/status` then also reports the gate: which side is live, how many requests
+are in flight and waiting, how many flips so far, and the seconds requests have spent
+waiting at the gate.
+
 ## Acceptance test
 
 ```sh
@@ -143,13 +204,48 @@ file and in [docs/design.md](docs/design.md).
 `--read-only` reads a server without touching any switch and saves the answers, for a
 reference reading to set beside the flipped state.
 
+For a gated server:
+
+```sh
+python3 tools/gate_acceptance.py http://HOST:8000 MODEL_NAME --prefix /free --out report.json
+```
+
+It answers four questions, three of them exactly.
+
+- Is every answer marked with the side it was asked on? (the header)
+- Do the two sides keep their cached prefixes apart, and does a flip leave them alone?
+  One long prompt goes to both endpoints under the same client salt, and the server's
+  own counters on `/metrics` are read around each request: the first request on the
+  overlay must reuse nothing of what the base side cached, and base must still reuse
+  its own after going there and back.
+- Did the server flip as often as the side changed? (the gate's own count, with
+  `--status`)
+- Is a request ever answered by the other side's weights? This one is read from the
+  answers. Each endpoint is read six times; a position where the two groups of margins
+  stand at least three logits apart becomes a landmark. The prompts that have one are
+  then asked on both endpoints in turn, a flip before every request, and in bursts of
+  both at once. An answer that lies as far over as the other side's reference answers
+  fails the test. One that is past the middle but short of the other group reads like
+  neither, and the test says it cannot tell.
+
+That last rule was set by measurement, after a simpler one ("the wrong side of the
+middle") turned out to cry wolf. Readings from the setup above in which nothing was
+mixed were replayed through the rule: of 738 answers none lay with the other group and
+2 lay in the stretch between. With the labels swapped on purpose, 185 of 216 lay with
+the other group, 31 in the stretch between, and none passed as its label.
+
 ## Limits
 
 - One engine build (see Scope), one model path (DeepSeek V4.1, native kernels), one
   kind of tensor (`attn.wo_b` weight and scale). Anything else in the side file is
   refused.
-- One set for everyone. A flip changes the model for all requests; a choice per request
-  is not possible with this kernel (one set of weights per batch).
+- One set at a time. A flip changes the model for every request that runs; the kernel
+  takes one set of weights per batch. The gate gives each request the set its path asks
+  for by taking turns, not by running both at once.
+- Behind the gate a request for the other side waits as long as the longest request in
+  flight. A client that never finishes reading its answer holds the other side up.
+- The gate has not been tried with `--root-path`, and it holds a request's whole body in
+  memory to mark it (up to 64 MB).
 - The switched tensors are read from disk at every flip.
 - Layers that belong only to a speculative-decoding draft model are not switched.
 

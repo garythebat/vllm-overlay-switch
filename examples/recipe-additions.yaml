@@ -1,8 +1,8 @@
 # What to add to a recipe of eugr/spark-vllm-docker to get the overlay switch.
 #
 # This is a fragment, not a recipe: merge the four marked items into the recipe you already
-# serve the BASE checkpoint with. Paths are placeholders. Not run as written; see the README
-# for what has and has not been tested.
+# serve the BASE checkpoint with (the fifth is optional). Paths are placeholders. Not run as
+# written; see the README for what has and has not been tested.
 
 mods:
   - mods/overlay-switch        # (1) a copy of this repository's mod/ folder inside your
@@ -17,6 +17,12 @@ env:
   # (3) The side file with the alternate tensors, as the container sees it. It must be
   #     readable at this path on every machine of the cluster.
   OVERLAY_SWITCH_FILE: "/root/.cache/huggingface/overlay/side.safetensors"
+
+  # (5) Optional: two endpoints on the one server. With this set, the base set answers on
+  #     the usual paths (http://HOST:8000/v1) and the overlay under the prefix
+  #     (http://HOST:8000/free/v1), and the server flips by itself. Leave it out to keep
+  #     one endpoint and flip by hand.
+  # OVERLAY_GATE_PREFIX: "/free"
 
   # Optional. Who may call the switch besides the machine the server runs on, and a shared
   # secret that every call must then carry in the X-Overlay-Token header.

@@ -1,7 +1,8 @@
 # Design
 
 Status: written from a reading of the engine source, tested off the hardware, and run on
-one setup on 14 November 2026 (see the table in the README). Every reference below is to the pinned
+one setup on 14 November 2026 (see the table in the README). The gate (two endpoints on
+one server) is written and tested off the hardware only. Every reference below is to the pinned
 commits listed in the README; `path:line` is in the vLLM fork unless it starts with
 `flashinfer/`.
 
@@ -164,6 +165,83 @@ A call that times out does not cancel what the ranks were asked to do: the reque
 queued on the workers and still runs. Since the copy back is queued behind it, the end
 state is still the previous set. What the engine does with late answers was not traced.
 
+## The gate: two endpoints on one server
+
+With `OVERLAY_GATE_PREFIX=/free` the base set answers on the usual paths and the overlay
+on the same paths under the prefix. `mod/vllm_overlay_switch/gate.py` holds it; it imports
+nothing from the engine.
+
+**Where it goes in.** The app is built in a fixed order: the routers, then the endpoint
+plugins, then the engine's own middleware (`vllm/entrypoints/launchers/app.py:42-54`,
+`vllm/plugins/endpoint_plugins/interface.py:91-105`,
+`vllm/entrypoints/serve/middleware/register.py:19-80`). Middleware added later wraps what
+was added earlier. So a pure ASGI middleware added inside the plugin's `attach_router` is
+the innermost one: it sees a request after CORS, the API key, the request id and whatever
+`--middleware` names, and nothing stands between it and the routes. The installer checks
+that order in the engine it installs into.
+
+**Admission, not the engine's pause.** The kernel takes one set of weights for everything
+it decodes together (`vllm/models/deepseek_v4_1/attention.py:1754-1767`), so the two sides
+have to take turns. The engine's pause cannot arrange that by itself: what arrives while
+it is paused is queued and run after the resume, on whatever is live then
+(`vllm/v1/engine/core.py:2091-2124`). The gate therefore decides before the engine sees a
+request. It keeps one line. A request is let in when its side is live and nobody for the
+other side stands before it; the first in line may flip once nothing is in flight. "In
+flight" ends when the app has finished with the request, which for a streamed answer is
+the end of the stream or the client going away. Behind that stands the flip's own pause in
+`wait` mode, which lets the engine run until it is idle before anything is copied: a
+request the client abandoned a moment ago is finished or aborted by then.
+
+**Each side its own cache, and no clearing.** A cached block is known by a hash over its
+tokens, its parent's hash and a few extra keys; the request's `cache_salt` is one of them
+for the first block (`vllm/v1/core/kv_cache_utils.py:618-629`), and through the parents
+for every block after it. The weights are not part of the hash, which is why the manual
+flip clears the cache. The gate instead sets the salt of every request it lets in to
+`overlay-gate:<side>`, followed by a digest of the client's own salt if it sent one (the
+engine accepts at most 128 characters and no `/`, `@` or backslash,
+`vllm/entrypoints/generate/base/protocol.py:36-51`). Blocks made on one side can then
+only be found by requests of that side, which only run while that side is live. Because
+a flip back is byte exact (the `derived` digest), those blocks stay right, and the gate
+flips with `pause_generation(clear_cache=False)`
+(`vllm/v1/engine/async_llm.py:913-949`). The body is parsed and written again with
+exactly one `cache_salt`, so a client cannot slip in a second one.
+
+**What must not pass.** Only requests the gate has marked may run the model. So it lets
+through `GET`, `HEAD` and `OPTIONS`, two routes that do not run the model, and the four
+that do and take a salt; every other route answers 403, and a websocket is closed. A
+`/v1/responses` request with `background` set is refused too: the engine answers such a
+request at once and runs the model afterwards in a task of its own
+(`vllm/entrypoints/openai/responses/serving.py:508-556`), which is after the gate has
+counted the request as ended.
+
+**The API key.** The engine's key check looks at how a path begins and guards `/v1`,
+`/v2`, `/inference` and `/cohere` (`vllm/entrypoints/serve/middleware/authenticate.py:11,
+47-62`). `/free/v1/chat/completions` begins with none of them, so it reaches the gate
+unchecked, and the gate then takes the prefix off. Left like that, the prefix would be a
+way around the key. The plugin therefore builds the engine's own `AuthenticationMiddleware`
+with the keys the engine itself uses (`--api-key`, else `VLLM_API_KEY`, as in
+`register.py:33-37`) and the gate runs everything under the prefix through it, on the
+inner path. If there is a key and that class cannot be imported, `attach_router` raises
+and the server does not start.
+
+**When a flip goes wrong.** A flip that fails and puts the previous set back answers 503
+to the request that asked for it, and the live side goes on serving. A flip that leaves
+generation paused, or that is cut off half way (the task that asked for it was cancelled),
+shuts the gate: every request gets 503 until a forced flip by hand has written one set
+onto every rank.
+
+**What the acceptance test can read exactly.** The scheduler counts, per request, the
+tokens it looked up in the prefix cache and the tokens it found
+(`vllm/v1/core/kv_cache_manager.py:329-338`, `vllm/v1/metrics/stats.py:131-142`), and
+`/metrics` shows the sums (`vllm/v1/metrics/loggers.py:647-664`). Read around single
+requests, with the count of finished requests beside them to notice other traffic, they
+say whether a request on one side reused what the other side had cached.
+
+Not traced in the source: whether anything besides the block hash keeps results by prompt
+across requests in the speculative-decoding path. The draft layers have weights of their
+own that are not switched, and the test above would show a reuse across the sides in the
+counters; it would not show a cache the counters do not count.
+
 ## Memory and time
 
 For the motivating case the side file holds 26 weights of 5120 x 8192 (42 MB each, as
@@ -240,6 +318,7 @@ On the tested setup (14 November 2026):
 
 Still open:
 
+- The gate on hardware: its acceptance test has not run against a real server.
 - Worker and queue state after a `collective_rpc` timeout.
 - A flip while requests are in flight, and under load from several clients.
 - Other tensor-parallel sizes, where the padding falls differently.
