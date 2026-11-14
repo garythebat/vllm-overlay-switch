@@ -23,8 +23,16 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "tools"))
+sys.path.insert(0, os.path.join(HERE, "..", "mod"))
 import acceptance  # noqa: E402
 import gate_acceptance  # noqa: E402
+from vllm_overlay_switch import effort as efforts  # noqa: E402
+
+TAKEN = ("none", "low", "high", "xhigh", "max")              # what the stand-in's "engine" takes, and integers 1 to 100
+
+
+def translation():
+    return efforts.Effort(TAKEN, {"minimal": "low", "medium": "high", "ultra": "max"}, "high", (1, 100))
 
 METRICS = """# HELP vllm:prefix_cache_queries_total Prefix cache queries, in terms of number of queried tokens.
 # TYPE vllm:prefix_cache_queries_total counter
@@ -57,7 +65,8 @@ class StandIn(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         b, path = self.b, self.path.removeprefix("/free")
         if path == "/v1/models":
-            return self.answer(200, {"data": [{"id": "m"}, {"id": "m-free"}]})      # one model under two names
+            listing = json.dumps({"data": [{"id": "m"}, {"id": "m-free"}]}).encode()   # one model under two names
+            return self.answer(200, listing if b.get("no_effort") or b.get("no_listing") else translation().advertise(listing))
         if path == "/metrics" and not b.get("no_metrics"):
             with self.lock:
                 text = METRICS.format(queried=float(b["queried"]), hit=float(b["hit"]), stopped=float(b["finished"]), length=0.0)
@@ -76,7 +85,12 @@ class StandIn(http.server.BaseHTTPRequestHandler):
         by_name = body.get("model") == "m-free" and not self.path.startswith("/free/") and not b.get("name_ignored")
         asked = "overlay" if self.path.startswith("/free/") or by_name else "base"
         prompt = body["messages"][0]["content"]
-        tag = body["cache_salt"].split("-")[1]                 # ref, turn, burst, cache or rest: which part of the test asks
+        notes = [] if b.get("no_effort") else translation().apply(body)       # the gate's part: translate ...
+        top, inner = body.get("reasoning_effort"), (body.get("chat_template_kwargs") or {}).get("reasoning_effort")
+        if (top is not None and top not in TAKEN) or not (inner is None or inner in TAKEN or (type(inner) is int and 1 <= inner <= 100)):
+            return self.answer(400, {"error": {"message": "reasoning_effort must be low, high, xhigh, max, or an integer within [1, 100]"}},
+                               [("x-overlay-side", asked)])     # the engine refused it; the gate had let it in and marks it
+        tag = (body.get("cache_salt") or "x-effort").split("-")[1]   # ref, turn, burst, cache, rest or effort: which part asks
         tokens = len(prompt.split()) + 4
         with self.lock:
             b["count"] += 1
@@ -90,7 +104,7 @@ class StandIn(http.server.BaseHTTPRequestHandler):
             noise = 0.0 if leak or hybrid else b["rng"].uniform(-0.6, 0.6)
             b["by_name"] = b.get("by_name", 0) + by_name
             key = (None if b.get("shared_cache") else "named" if by_name and b.get("name_other_cache") else asked,
-                   body["cache_salt"], prompt)
+                   body.get("cache_salt"), prompt)
             reused = 0 if key not in b["cache"] or b.get("no_reuse") else (tokens - 1) // 16 * 16
             b["cache"].add(key)
             b["queried"] += tokens
@@ -107,8 +121,9 @@ class StandIn(http.server.BaseHTTPRequestHandler):
         out = [{"token": w, "logprob": -0.1, "top_logprobs": [{"token": w, "logprob": -0.1}]} for w in ("The", " answer")]
         out.append({"token": contenders[0][0], "logprob": contenders[0][1],
                     "top_logprobs": [{"token": t, "logprob": lp} for t, lp in contenders]})
-        self.answer(200, {"choices": [{"message": {"content": "x"}, "logprobs": {"content": out}}], "usage": {"prompt_tokens": tokens}},
-                    () if b.get("unmarked") else (("x-overlay-side", "base" if b.get("mismarked") else asked),))
+        marks = [] if b.get("unmarked") else [("x-overlay-side", "base" if b.get("mismarked") else asked)]
+        marks += [("x-reasoning-effort", efforts.header_value(notes).decode())] if notes else []
+        self.answer(200, {"choices": [{"message": {"content": "x"}, "logprobs": {"content": out}}], "usage": {"prompt_tokens": tokens}}, marks)
 
 
 class Tool(unittest.TestCase):
@@ -177,6 +192,32 @@ class Tool(unittest.TestCase):
         self.assertEqual(status, 3, text)
         self.assertIn("not 'nobody'", text)
         self.assertEqual(StandIn.b["count"], 0)
+
+    def test_every_effort_a_client_may_send_is_answered_on_every_way_in(self):
+        status, text = self.run_tool("--effort-check", "--overlay-model", "m-free")
+        self.assertEqual(status, 0, text)
+        self.assertIn("reasoning_effort: 42 of 42 requests answered 200", text)
+        self.assertIn("all 42 reasoning_effort requests were answered", text)
+        self.assertIn("reasoning_effort 'medium'   top level             200 medium -> high", text)
+        self.assertIn("reasoning_effort 50         top level             200 50 moved to chat_template_kwargs", text)
+        self.assertIn("reasoning_effort 50         chat_template_kwargs  200 as it is", text)
+        self.assertIn("'reasoning_efforts': ['none', 'low', 'high', 'xhigh', 'max']", text)
+        self.setUp()
+        status, text = self.run_tool("--effort-check")
+        self.assertEqual(status, 0, text)
+        self.assertIn("reasoning_effort: 28 of 28 requests answered 200", text)
+
+    def test_an_engine_left_to_refuse_them_fails_the_effort_check(self):
+        status, text = self.run_tool("--effort-check", no_effort=True)
+        self.assertEqual(status, 1, text)
+        self.assertIn("reasoning_effort request(s) were not answered 200, e.g. 'medium' (top level, base): 400", text)
+        self.setUp()
+        self.assertEqual(self.run_tool(no_effort=True)[0], 0)             # not asked for: not looked at
+
+    def test_a_model_list_that_keeps_quiet_about_the_efforts_fails_it_too(self):
+        status, text = self.run_tool("--effort-check", no_listing=True)
+        self.assertEqual(status, 1, text)
+        self.assertIn("the model list does not say which reasoning efforts each model accepts", text)
 
     def test_one_request_in_five_on_the_wrong_weights_fails_and_is_shown(self):
         status, text = self.run_tool(leaks=True)

@@ -45,6 +45,12 @@ started with OVERLAY_GATE_MODELS): every other mixed request for the overlay goe
 the cache check asks once by name for what was cached under the prefix. The same four questions
 then cover both ways in.
 
+With --effort-check (a server started with OVERLAY_GATE_EFFORT_KEEP) a fifth question, exact:
+is every reasoning_effort a client with its own ladder may send answered, on every way in and
+in both places a request can carry it? The words medium, minimal, ultra and a made-up one, and
+the integers 50, 0 and 101, must each come back 200, and the model list must say what the
+model accepts.
+
     python3 tools/gate_acceptance.py http://HOST:8000 MODEL_NAME --prefix /free --out report.json
 
 Exit status: 0 passed; 1 shown not to work; 2 cannot tell (too few landmarks, or the cache
@@ -71,6 +77,7 @@ CACHE_STEPS = (("base", "first on base"), ("base", "again on base"), ("overlay",
                ("overlay", "again on the overlay"), ("base", "back on base"))
 COUNTERS = {"queried": "vllm:prefix_cache_queries_total", "hit": "vllm:prefix_cache_hits_total",
             "finished": "vllm:request_success_total"}
+EFFORTS = ("medium", "minimal", "ultra", "banana", 50, 0, 101)
 
 
 def endpoint(args, side):
@@ -248,6 +255,28 @@ def cache_check(args):
             "why": f"in {len(attempts)} attempts the counters never moved by exactly this test's own requests (other traffic?)"}
 
 
+def effort_check(args):
+    """Every effort a client may send, on every way in, at the top level and in chat_template_kwargs."""
+    ways = [("base", "base", args.server, args.model)]
+    if args.overlay_model:
+        ways.append((f"overlay by the name {args.overlay_model}", "overlay", args.server, args.overlay_model))
+    ways.append((f"overlay under {args.prefix}", "overlay", endpoint(args, "overlay"), args.model))
+    rows = []
+    for way, side, base, model in ways:
+        for value in EFFORTS:
+            for place in ("top level", "chat_template_kwargs"):
+                body = {"model": model, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 4, "temperature": 0}
+                body.update({"reasoning_effort": value} if place == "top level" else {"chat_template_kwargs": {"reasoning_effort": value}})
+                status, answer, headers = acceptance.call(base + "/v1/chat/completions", body, auth(args), with_headers=True)
+                seen = {k.lower(): v for k, v in headers.items()}
+                rows.append({"way": way, "asked": side, "side": seen.get("x-overlay-side"), "value": value, "place": place,
+                             "status": status, "said": seen.get("x-reasoning-effort"),
+                             "error": None if status == 200 else str((answer.get("error") or {}).get("message") or answer)[:200]})
+    code, listing = acceptance.call(args.server + "/v1/models", headers=auth(args), timeout=30)
+    listed = {m.get("id"): {k: v for k, v in m.items() if k.startswith("reasoning_effort")} for m in listing.get("data", [])} if code == 200 else {}
+    return {"rows": rows, "refused": [r for r in rows if r["status"] != 200], "listed": listed}
+
+
 def main():
     parser = argparse.ArgumentParser(description="Acceptance test for the overlay gate (see the top of this file).")
     parser.add_argument("server", help="base URL of the server, e.g. http://127.0.0.1:8000")
@@ -266,6 +295,8 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=24)
     parser.add_argument("--top", type=int, default=20)
     parser.add_argument("--thinking-kwarg", default="enable_thinking")
+    parser.add_argument("--effort-check", action="store_true",
+                        help="also send every reasoning_effort of a seven-step client; each must be answered 200")
     parser.add_argument("--no-cache-check", action="store_true", help="leave the cache counters out (a server without /metrics)")
     parser.add_argument("--cache-attempts", type=int, default=3)
     parser.add_argument("--counter-wait", type=float, default=5.0, help="seconds to wait for the counters after a request")
@@ -324,11 +355,16 @@ def main():
     if not args.no_cache_check:
         print("the cache: one long prompt, five requests, the server's counters around each", flush=True)
         cache = cache_check(args)
+    effort = None
+    if args.effort_check:
+        print(f"reasoning_effort: {len(EFFORTS)} values, at the top level and in chat_template_kwargs, on every way in", flush=True)
+        effort = effort_check(args)
     read(args, "base", "rest", 0, 0)                      # leave the server on the usual side
 
     everything = reference + mixed
     cache_steps = [s for attempt in (cache or {}).get("attempts", []) for s in attempt]
-    wrong_mark = [a for a in everything + cache_steps if a["side"] != a["asked"]]
+    answered = [r for r in effort["rows"] if r["status"] == 200] if effort else []     # a refusal is reported as one, below
+    wrong_mark = [a for a in everything + cache_steps + answered if a["side"] != a["asked"]]
     strays, between, placed, unplaced = judge(mixed, marks)
     for i in telling:
         print(f"\n{PROMPTS[i][:70]!r}")
@@ -360,12 +396,20 @@ def main():
         print(f"the gate counted {flips} flips for the {in_turn} requests asked in turn; it now says {gate_after}")
     if cache:
         print(f"the cache: {cache['verdict']}: {cache['why']}")
+    if effort:
+        said = {}
+        for row in effort["rows"]:
+            said.setdefault((repr(row["value"]), row["place"]), set()).add(f"{row['status']} {row['said'] or 'as it is'}")
+        for (value, place), answers in said.items():
+            print(f"  reasoning_effort {value:10} {place:21} {' | '.join(sorted(answers))}")
+        print(f"reasoning_effort: {len(effort['rows']) - len(effort['refused'])} of {len(effort['rows'])} requests answered 200; "
+              f"the model list says: {effort['listed'] or 'nothing'}")
     if args.out:
         with open(args.out, "w") as f:
             json.dump({"server": args.server, "model": args.model, "prefix": args.prefix, "at": time.strftime("%Y-%m-%d %H:%M:%S"),
                        "passes": args.passes, "min_gap": args.min_gap, "overlay_model": args.overlay_model,
                        "gate": {"before": gate_before, "after": gate_after},
-                       "cache": cache, "strays": strays, "between": between, "placed": placed, "unplaced": unplaced,
+                       "cache": cache, "effort": effort, "strays": strays, "between": between, "placed": placed, "unplaced": unplaced,
                        "landmarks": [{"prompt": PROMPTS[i], "marks": marks[i]} for i in marks],
                        "reference": reference, "mixed": mixed}, f, indent=1)
         print("saved", args.out)
@@ -391,6 +435,14 @@ def main():
     if flips is not None and flips < in_turn:
         print(f"FAIL: {in_turn} requests each changed the side, and the gate counted only {flips} flips.")
         return 1
+    if effort and effort["refused"]:
+        first = effort["refused"][0]
+        print(f"FAIL: {len(effort['refused'])} reasoning_effort request(s) were not answered 200, e.g. {first['value']!r} "
+              f"({first['place']}, {first['way']}): {first['status']} {first['error']}")
+        return 1
+    if effort and not all(m.get("reasoning_efforts") for m in effort["listed"].values()) or (effort and not effort["listed"]):
+        print("FAIL: the model list does not say which reasoning efforts each model accepts.")
+        return 1
     if len(telling) < args.need or not placed:
         print(f"CANNOT TELL: landmarks on {len(telling)} prompts (wanted {args.need}), {placed} mixed answers reached one. These "
               "prompts do not separate the two sides clearly enough; this is not proof of anything.")
@@ -406,8 +458,9 @@ def main():
         return 2
     said = {None: "the cache was not looked at", "apart": "each side reused only its own cached prefix, also after two flips",
             "no reuse": "this server reuses no prefixes, so there was nothing to keep apart"}[cache and cache["verdict"]]
+    efforts_said = f"; all {len(effort['rows'])} reasoning_effort requests were answered" if effort else ""
     print(f"PASS: all {len(everything)} answers carry their side; the {placed} mixed answers that reached a landmark all lie "
-          f"with their side, on {len(telling)} prompts; {said}.")
+          f"with their side, on {len(telling)} prompts; {said}{efforts_said}.")
     return 0
 
 
