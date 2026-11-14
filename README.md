@@ -5,270 +5,272 @@ SPDX-License-Identifier: Apache-2.0
 
 # vllm-overlay-switch
 
-Flip a small set of weights in a running vLLM server, in place, without a relaunch.
+Switch a running vLLM server between a model's base weights and a weight overlay in about
+two seconds, in place, without reloading the model.
+
+An overlay is a variant of a checkpoint that differs from it in only a few tensors, for
+example an abliterated version. Deployed as two servers, changing from one to the other
+means reloading hundreds of gigabytes. With this plugin the base checkpoint is loaded
+once and only the tensors that differ are rewritten.
+
+- **In place.** The tensors are overwritten on the GPU while the server stays up. There
+  is no second copy of the model, and nothing extra is held in memory between switches.
+- **Two models from one server (optional).** Base and overlay can be exposed as two model
+  names, or as `/v1` and `/free/v1`. The server switches automatically per request, and a
+  response header reports which variant answered.
+- **Verified on every switch.** Each node reads the switched tensors back from the device
+  and compares them with the requested variant. If the nodes disagree, the switch is
+  rolled back.
+- **Separate prompt caches.** With the two endpoints enabled, base and overlay each keep
+  their own prefix cache, and a switch clears neither.
+
+**Status: experimental.** Tested on one setup: three DGX Spark nodes (tensor parallel 3)
+serving DeepSeek V4.1 Flash. See [Status and results](#status-and-results) and
+[Limitations](#limitations).
 
 ## Why
 
-A large checkpoint can take minutes to load across several machines. Some weight
-overlays change only a handful of tensors. The case that started this: 52 tensors,
-about 1.1 GB, out of a checkpoint of roughly 475 GB (the attention output projection
-`wo_b` of layers 10 to 35 of DeepSeek V4.1 Flash).
+Loading a large checkpoint across several nodes takes minutes, and some overlays change
+very little of it. The one this was built for, an abliterated DeepSeek V4.1 Flash,
+differs from the base model in 52 tensors: 1.1 GB out of roughly 475 GB (the attention
+output projection `wo_b` of layers 10 to 35).
 
-Serving the base model and such an overlay as two separate runs means a stop and a
-relaunch every time you change your mind, several minutes each way, and two copies
-never fit in memory together. The aim here is one loaded model that normally runs the
-base weights and can be flipped to the overlay, and back, with one call. Or, with the
-gate switched on, one server that answers with the base weights on its usual paths and
-with the overlay on the same paths under a prefix, and flips by itself.
+Deployed as two servers, changing between base and overlay means a full stop and
+relaunch, about six minutes on the test setup, and the prompt cache is lost each time. On
+this hardware the two do not fit in memory together. With one loaded model and a
+two-second switch, the base model can stay the default and the overlay is available on
+request.
 
-### Why the base model stays the default
+### Why keep the base model as the default
 
-The overlay that started this removes the model's refusals. Its author describes it as an
-overlay, not a full checkpoint, changing only the `wo_b` tensors of layers 10 to 35, and
-keeps it behind a Responsible Use Agreement: with the refusals gone, the safeguards are
-the operator's to supply.
+Abliteration removes a model's refusals by editing weights that take part in every
+forward pass, so its effect is not necessarily limited to refusals.
 
-An edit of that kind is made for one behaviour, but the tensors it changes take part in
-every answer. What is known about the cost:
+- Arditi et al., [Refusal in Language Models Is Mediated by a Single
+  Direction](https://arxiv.org/abs/2406.11717) (2024), the paper the technique comes
+  from, describe an edit that "surgically disables refusal with minimal effect on other
+  capabilities". Their edited models scored close to the originals on MMLU, ARC and
+  GSM8K, but accuracy on TruthfulQA dropped consistently.
+- Maxime Labonne, [Uncensor any LLM with
+  abliteration](https://huggingface.co/blog/mlabonne/abliteration) (2024), reports "a
+  performance drop in the ablated version across all benchmarks" for the model in the
+  article, most of which further training recovered.
+- Richard J. Young, [Comparative Analysis of LLM Abliteration
+  Methods](https://arxiv.org/abs/2512.13655) (preprint, 2025), compared four tools on
+  sixteen models. The change in GSM8K ranged from +1.51 to -18.81 percentage points
+  depending on tool and model. Two single-pass tools averaged -0.28 and -0.13 points over
+  the three models benchmarked.
 
-- **The work the technique comes from** found the effect on other abilities small but not
-  nil. Arditi and others, [Refusal in Language Models Is Mediated by a Single
-  Direction](https://arxiv.org/abs/2406.11717) (2024), describe an edit that "surgically
-  disables refusal with minimal effect on other capabilities". On MMLU, ARC and GSM8K
-  their edited models scored like the originals, while accuracy on TruthfulQA dropped
-  consistently.
-- **In practice the cost has ranged from nothing to a great deal.** Maxime Labonne's
-  [Uncensor any LLM with abliteration](https://huggingface.co/blog/mlabonne/abliteration)
-  (2024), the write-up that made the method widely known, reports "a performance drop in
-  the ablated version across all benchmarks" for the model it works on, most of it
-  recovered by further training. Richard J. Young's [Comparative Analysis of LLM
-  Abliteration Methods](https://arxiv.org/abs/2512.13655) (a preprint, 2025) ran four
-  tools over sixteen models and found the change in GSM8K, a test of arithmetic
-  reasoning, ranging from +1.51 to -18.81 percentage points depending on tool and model.
-  Two single-pass tools averaged -0.28 and -0.13 points over the three models benchmarked.
-- **For this overlay it has not been measured.** Its card reports refusal tests and
-  speed, and no measurement of general ability (as read on 14 November 2026). We have
-  not measured it either.
-- **What we did measure** is that the two sets differ on ordinary questions. Of eight
-  plain prompts with nothing sensitive in them, three told the sets apart at a single
-  word: why the sky is blue, a word of advice about baking bread, what a keel does for a
-  boat. The preference between two candidate words differed by 3 to about 7 logits, on
-  two separate launches. That shows the overlay moves ordinary answers. It does not show
-  that it makes them worse.
+The overlay used here is published as an overlay, not a full checkpoint, behind its
+author's Responsible Use Agreement. Its model card reports refusal and speed tests but no
+general-capability benchmark (as of November 2026), and we have not benchmarked it
+either. What we did measure is that it changes responses to ordinary prompts: on 3 of 8
+neutral prompts, the logit margin between two candidate tokens differed by 3 to about 7
+logits between base and overlay, on two separate launches. That shows a difference, not
+a regression.
 
-So the base model is the one to do everyday work on, and the edited one is for the task
-the base model will not do. Served as two runs, that choice costs a stop and a relaunch
-at every change of mind, and the easy thing becomes leaving the edited model up. Served
-as one, the default costs nothing, the overlay is two seconds away and has to be asked
-for by name or by address, and every answer says which set gave it.
+So the practical setup is to run the base model for everyday work and to use the overlay
+only for requests the base model refuses. With two deployments every change costs a
+relaunch, and the easy option is to leave the abliterated model running. With this
+plugin the base model is the default, the overlay is two seconds away, it has to be
+requested explicitly (by model name or by URL), and every response reports which variant
+produced it.
 
-Two cautions. The switch is not a safeguard: it filters nothing, and whoever can reach
-the port can ask for the overlay unless an API key or the network says otherwise. And
-the two sets never run at once: mixed traffic takes turns, as the limits below describe.
+> [!WARNING]
+> This is not a safety mechanism. It filters nothing, and anyone who can reach the server
+> can request the overlay unless an API key or the network prevents it.
 
-## Status
+## Status and results
 
-This has run on one cluster so far: three machines of the DGX Spark family serving
-DeepSeek V4.1 Flash together, on the engine build listed under [Scope](#scope). On
-14 November 2026 it passed its acceptance test there, on two memory settings. On a
-different setup, run the [acceptance test](#acceptance-test) first. Here it took under
-four minutes.
+Experimental. It has been tested on one setup:
 
-| Part | How it has been checked |
+| | |
 |---|---|
-| The order of a flip, putting things back when a rank fails, the forced way out, who may call | unit tests with a stand-in engine (`tests/test_logic.py`) |
-| The HTTP routes | unit tests with FastAPI's test client and a stand-in engine (`tests/test_api.py`) |
-| Reading tensors out of safetensors files | unit tests on hand-made files (`tests/test_stfile.py`) |
-| The worker half: which columns a rank holds, overwriting in place, reading back, leaving padding alone, refusing what it does not understand | unit tests with real torch tensors (torch 2.13.0, the engine image's version, CPU build), real files, three simulated ranks, and stand-ins for the engine's modules (`tests/test_worker.py`) |
-| That the code fits the engine | read against the engine source at the commits listed under Scope; references in [docs/design.md](docs/design.md) |
-| The installer `mod/run.sh` | dry run against a folder laid out like the image's package folder; then run inside the image on each of the three machines at every launch. It found no plugins in the image beyond vLLM's own two |
-| The acceptance tool itself | run against a stand-in server whose behaviour is known: a pass, each failure verdict, a drift between readings, an older switch without the digest, "cannot tell" (`tests/test_acceptance.py`) |
-| A flip on a GPU, under captured CUDA graphs, across machines | run. Preparing took 3.9 s; a flip 1.4 to 2.0 s end to end, of which the pause before the copy is 0.03 s. After every flip each machine read all its tensors back as the set asked for |
-| That flipping back restores the model | exact: the digest of everything derived from the switched weights, read on a freshly started server before anything was prepared, was the same on every rank after flipping to the overlay and back. Seen on two separate launches |
-| That the model reads what a flip wrote | six independent passes per set: five of eight prompts told the two sets apart (every margin of one set on one side, every margin of the other on the other) |
-| That the flipped state is the overlay model | the overlay was also loaded as a model of its own and read with `--read-only`. Wherever base and flipped stood apart, it lay on the flipped side with nearly the same medians, and at none of 34 positions did it stand apart from the flipped state |
-| Memory | six flips in a row left free memory where it was |
-| The gate (two endpoints on one server): who is let in when, the line, a failed or interrupted flip, what passes and what is refused, the API key under the prefix | unit tests with a stand-in engine and a stand-in server that records what the engine held while each request ran (`tests/test_gate.py`), and through FastAPI as the plugin installs it (`tests/test_api.py`). 54 faults made on purpose in the gate, the effort translation and the acceptance tool were each caught by a test. Then run on the setup above: the rows marked "on hardware" below |
-| The gate's acceptance tool | run against a stand-in server that can go wrong in each way the tool exists to catch (`tests/test_gate_acceptance.py`). Its rule for reading an answer was set after replaying real readings through it: see "Acceptance test" |
-| Choosing the side by model name; the translation of `reasoning_effort` | unit tests (`tests/test_gate.py`, `tests/test_effort.py`) and through FastAPI as the plugin installs them (`tests/test_api.py`). What the engine refuses today was read from a running server of the setup above: `minimal`, `medium` and unknown words in either place, integers at the top level, integers outside 1 to 100. Then run on the setup above: the rows marked "on hardware" below |
-| The gate on hardware: does each endpoint and each name get its own side | run with `tools/gate_acceptance.py`: PASS. All 156 answers carried the mark of the side they had asked for. Six passes per endpoint as reference; three of eight prompts told the sides apart by at least 3 logits. Then 60 mixed requests: 36 in turn with the other side at every request, and two bursts of 12 at once; half of the overlay's were asked by model name on the usual path and half under the prefix. All 60 reached a landmark and all 60 lay with their own side |
-| The gate on hardware: what a change of side costs | an answer took 0.69 s on average in the reference and 2.22 s when the side had to change first (36 answers, 2.02 to 2.66 s). The gate counted 36 flips for the 36 requests asked in turn. Asked at once from both sides, requests take strict turns: in the two bursts of 12 an answer took 0.6 to 26.2 s, 11.2 s on average |
-| The gate on hardware: each side's own cache | the server's own prefix-cache counters around one 604-token prompt under one client salt: asked again on base it reused 256 tokens, the overlay's first request 0, the overlay again 256, the overlay by model name 256, and base after two flips 256. A flip cleared nothing |
-| `reasoning_effort` on hardware | 42 of 42 requests answered 200: seven values, at the top level and in `chat_template_kwargs`, by either model name and under the prefix. The header, the one log line per distinct translation and the fields in the model list were as described below |
-| The gate on hardware: a client that leaves in the middle of a streamed answer | by hand with a small probe, six rounds each way: after the client left, a request for the other side was answered in 2.1 to 3.0 s and lay with its own side every time (12 of 12) |
-| The gate on hardware: the weights afterwards | 60 flips into the launch every tensor read back as base on every rank, and the digests of everything derived from them were the startup's |
-| The gate on hardware: memory during a flip | free memory read five times a second on each machine during six flips: it dipped at most 0.07 GiB and came back |
-| The gate on hardware: a second launch with far less room | the same server with a 1,048,576-token window and a 3 GB KV cache per machine, which leaves each machine a few GiB free instead of six to eight. The same acceptance test passed: 156 answers each on its own side, 60 mixed answers all with their own side, 0.61 s an answer on average and 2.24 s when the side had to change first, each side its own cache, 42 of 42 effort requests answered 200, and every tensor read back as base with the startup's digests 60 flips into the launch. The first two flips dipped free memory by 0.03 GiB; over four minutes of flips and bursts the lowest reading on the tightest machine was 1.89 GiB, against 1.7 GiB after its first requests and before any flip |
-| Not tested | the manual switch while requests are in flight or under load from several clients; the API-key check under the prefix on a real server (the stand-in copies the engine's rule); other tensor-parallel sizes; finding the checkpoint by its served name on hardware (the test setup named the folder with `OVERLAY_SWITCH_BASE_DIR`); under the gate: a long generation on one side while the other is asked (the wait is by design, its length was not measured), a long cached conversation on each side at once (the tests' prompts are short), a client that gives up while it waits in the line, a server started with `--root-path` |
+| Hardware | 3 nodes of the DGX Spark family (2x NVIDIA DGX Spark, 1x Gigabyte AI TOP ATOM), 128 GB unified memory each |
+| Model | DeepSeek V4.1 Flash 1017, tensor parallel 3 |
+| Overlay | Keys abliteration overlay: 52 tensors, 1.1 GB |
+| Engine | vLLM fork with the DeepSeek V4.1 native path (see [Compatibility](#compatibility)) |
 
-## How it works
+Both acceptance tests pass on this setup, in a lean configuration (262,144-token context,
+`--kv-cache-memory-bytes 500m`) and in a large one (1,048,576-token context,
+`--kv-cache-memory-bytes 3g`). The numbers below are from the lean configuration unless
+noted.
 
-No engine file is edited. Two small pieces are added through extension points the
-engine already has:
+| Measurement | Result |
+|---|---|
+| Switch time | 1.4 to 2.0 s |
+| One-time preparation before the first switch | 3.9 s |
+| Response time, no switch needed | 0.69 s mean, short prompts (large configuration: 0.61 s) |
+| Response time, switch needed first | 2.22 s mean, 2.02 to 2.66 s (large configuration: 2.24 s) |
+| Concurrent requests for both variants, two bursts of 12 | 0.6 to 26.2 s per response, 11.2 s mean |
+| Free memory during a switch | drops by at most 0.07 GiB, then recovers |
+| State after switching back | identical to a freshly started server, by a digest of all state derived from the switched weights on every node. Still identical after 60 switches |
+| Switched state compared with the overlay loaded as its own model | no difference at any of 34 compared token positions |
+| Routing with two endpoints | 156 of 156 responses carried the header of the requested variant. 60 of 60 alternating and concurrent requests matched their own variant's reference outputs |
+| Prefix cache with two endpoints | separate per variant, not cleared by a switch |
+| Client disconnecting mid-stream | the next request for the other variant was served in 2.1 to 3.0 s (12 of 12) |
+| `reasoning_effort` translation | 42 of 42 requests returned 200 |
+| Lowest free memory during the tests, large configuration | 1.89 GiB on the tightest node |
+| For comparison: stop and relaunch to change variant | about 6 minutes |
 
-- **On every machine**, a worker extension (`--worker-extension-cls`) that can overwrite
-  the live weight buffers of the switched tensors with one set or the other.
-- **On the API server**, an endpoint plugin with two routes: status and switch.
+Not yet tested:
 
-A flip:
+- the manual switch under load (requests in flight, several clients)
+- the API-key check under the prefix on a real server (unit-tested against a mock that
+  replicates vLLM's rule)
+- tensor-parallel sizes other than 3
+- locating the checkpoint by its served name (the test setup set
+  `OVERLAY_SWITCH_BASE_DIR`)
+- with two endpoints: a long generation on one variant while the other is requested (the
+  wait is by design, its length was not measured), long cached conversations on both
+  variants at once (the test prompts are short), a client that disconnects while queued,
+  and a server started with `--root-path`
 
-1. Pauses generation. Requests that are running finish first; requests that arrive
-   meanwhile are queued by the engine.
-2. On every machine, reads the chosen set from disk, keeps the columns that machine
-   holds, and copies them over the existing buffers. Then it rebuilds the small tables the
-   model derived from these weights at startup and copies those over the existing ones
-   too. Nothing is replaced, only overwritten, because captured CUDA graphs hold the
-   addresses of these buffers.
-3. Reads every switched tensor back from the device and compares it with both sets.
-4. If the machines do not all report the wanted set, copies the previous set back. If
-   that fails as well, generation stays paused and the answer says so: a model whose
-   machines hold different weights must not answer anyone.
-5. Clears the prefix cache (it does not know about weights) and resumes.
+To check your own deployment, see [Verifying a deployment](#verifying-a-deployment).
 
-Before its first flip, every machine proves its own reading of the files against the
-live model: it must find the live weights to be exactly the base set, tensor by tensor.
-If this tool's idea of which columns a machine holds did not fit the engine in front of
-it, that proof fails and nothing is ever written.
+## Installation
 
-Every machine also reports a digest of the whole of both sets as it read them from its
-own disk. A flip is refused unless all machines report the same two digests, so a side
-file that differs on one machine cannot go unnoticed. `force` does not override this.
+Requirements:
 
-Nothing is held in memory between flips. The price is that a flip reads the switched
-tensors from disk each time (about a gigabyte per machine for the case above).
-
-## Install
-
-The server must be started on the **base** checkpoint. The alternate tensors come from
-a **side file**: a safetensors file holding `layers.N.attn.wo_b.weight` (F8_E4M3) and
-`layers.N.attn.wo_b.scale` (F8_E8M0) under exactly those names, with the base
-checkpoint's shapes. This is the same kind of file an index-remapped overlay folder
-points at. It must be readable at the same path inside the container on every machine.
+- A vLLM build the plugin supports (see [Compatibility](#compatibility)).
+- The server is started on the **base** checkpoint.
+- A **side file** with the overlay's tensors: a safetensors file containing
+  `layers.N.attn.wo_b.weight` (F8_E4M3) and `layers.N.attn.wo_b.scale` (F8_E8M0) under
+  exactly those names, with the same shapes as in the base checkpoint. This is the file
+  an index-remapped overlay folder points at. It must be readable at the same path inside
+  the container on every node.
 
 With [spark-vllm-docker](https://github.com/eugr/spark-vllm-docker):
 
 1. Copy this repository's `mod/` folder into your checkout as `mods/overlay-switch`.
-2. Merge the four items of [examples/recipe-additions.yaml](examples/recipe-additions.yaml)
-   into your recipe: the mod, `VLLM_PLUGINS`, `OVERLAY_SWITCH_FILE`, and
-   `--worker-extension-cls vllm_overlay_switch.worker.OverlayWorkerExtension`. A fifth,
-   `OVERLAY_GATE_PREFIX`, turns on the two endpoints described below, a sixth,
-   `OVERLAY_GATE_MODELS`, lets the model name choose between them, and the
-   `OVERLAY_GATE_EFFORT_*` settings translate `reasoning_effort`.
-3. Launch as usual. The mod prints the exact `VLLM_PLUGINS` value for your image; that
-   variable is an allow-list for every vLLM plugin, so it has to name the ones the image
-   already loads as well. In the server log, look for
-   `Injected ... OverlayWorkerExtension ... for extended collective_rpc calls`.
+2. Add the four settings from [examples/recipe-additions.yaml](examples/recipe-additions.yaml)
+   to your recipe: the mod, `VLLM_PLUGINS`, `OVERLAY_SWITCH_FILE` (the side file) and
+   `--worker-extension-cls vllm_overlay_switch.worker.OverlayWorkerExtension`.
+   Optional: `OVERLAY_GATE_PREFIX` enables the two endpoints, `OVERLAY_GATE_MODELS` maps
+   a model name to the overlay, and the `OVERLAY_GATE_EFFORT_*` settings configure the
+   `reasoning_effort` translation.
+3. Launch as usual. `VLLM_PLUGINS` is an allow-list for all vLLM plugins, so it must also
+   name the plugins your image already loads. The mod prints the exact value to use at
+   startup. To confirm that the worker extension loaded, look for this line in the server
+   log: `Injected ... OverlayWorkerExtension ... for extended collective_rpc calls`.
 
-Without the mods mechanism, `pip install .` inside the image does the same as the mod.
+Without spark-vllm-docker, `pip install .` inside the image installs the same package.
 
 A complete example is in [examples/deepseek-v4.1-flash-1017/](examples/deepseek-v4.1-flash-1017/):
-the recipe as it ran, with every model, revision and file hash named.
+the recipe, the model revisions and the file hashes of the test setup.
 
-## Use
+## Usage
 
-By default the routes answer only to the machine the server runs on.
+### Manual switch
+
+The plugin adds two routes. By default they accept requests from localhost only.
 
 ```sh
-# which set is live (add ?full=1 to read every tensor back, not just the first and last layer)
+# Show the active variant (add ?full=1 to read back every tensor, not just the first and last layer)
 curl -s http://127.0.0.1:8000/overlay/status
 
-# flip to the overlay, and back
+# Switch to the overlay, and back
 curl -s -X POST http://127.0.0.1:8000/overlay/switch -H 'Content-Type: application/json' -d '{"variant": "overlay"}'
 curl -s -X POST http://127.0.0.1:8000/overlay/switch -H 'Content-Type: application/json' -d '{"variant": "base"}'
 ```
 
-- The first flip also prepares: every machine reads both sets once and proves its cut.
-- `"mode": "wait"` (the default) lets running requests finish before the copy;
-  `"mode": "abort"` ends them.
-- The served model name does not change. Nothing tells a client which set answered,
-  except the status route.
-- If a flip leaves generation paused, `{"variant": "base", "force": true}` writes that
-  set onto every machine whatever is there, and resumes only if they then all agree.
-  `force` cannot make a machine write that never proved its cut.
-- To let other addresses call the switch, set `OVERLAY_SWITCH_ALLOW` to a comma
-  separated list. If `OVERLAY_SWITCH_TOKEN` is set, every call must carry it in the
-  `X-Overlay-Token` header. These routes are outside the paths the engine's own API key
-  guards.
+- The first switch also runs a one-time preparation: each node reads both variants from
+  disk and verifies that its part of the base tensors matches the weights it has loaded.
+- `"mode": "wait"` (the default) lets in-flight requests finish before the switch.
+  `"mode": "abort"` cancels them.
+- A manual switch clears the prefix cache.
+- The served model name does not change, and responses do not say which variant is
+  active. Use the status route, or enable the two endpoints below, which add a response
+  header.
+- If a switch fails and leaves generation paused, `{"variant": "base", "force": true}`
+  writes that variant to every node regardless of its current state, and resumes only if
+  all nodes then agree. `force` has no effect on a node that never passed the preparation
+  check.
+- To allow remote callers, set `OVERLAY_SWITCH_ALLOW` to a comma-separated list of client
+  addresses. If `OVERLAY_SWITCH_TOKEN` is set, every call must send it in the
+  `X-Overlay-Token` header. These routes are not covered by vLLM's own API key.
 
-## Two endpoints on one server
+### Two endpoints on one server
 
-Set `OVERLAY_GATE_PREFIX=/free` in the launch and the one loaded model answers on two
-sets of paths:
+Set `OVERLAY_GATE_PREFIX=/free` to serve both variants from the one loaded model:
 
-| Base URL for a client | Answers with |
+| Base URL | Variant |
 |---|---|
-| `http://HOST:8000/v1` | the base set |
-| `http://HOST:8000/free/v1` | the overlay |
+| `http://HOST:8000/v1` | base |
+| `http://HOST:8000/free/v1` | overlay |
 
-A client picks a side by the base URL it is given and needs nothing else. The served
-model name is the same on both. Every answer of a request that ran the model carries a
-header, `x-overlay-side: base` or `overlay`.
+A client selects a variant by its base URL and needs nothing else. The model name is the
+same on both. Every response to a request that ran the model has an
+`x-overlay-side: base` or `x-overlay-side: overlay` header.
 
-Some clients pick from the server's model list instead of taking a base URL. For those,
-give the one model a second served name and tell the gate that this name means the
-overlay:
+For clients that select from the model list instead, give the model a second served name
+and map that name to the overlay:
 
 ```
 vllm serve ... --served-model-name BASE_NAME OVERLAY_NAME
 OVERLAY_GATE_MODELS=OVERLAY_NAME
 ```
 
-`GET /v1/models` then lists both names under the one address, and a request on the usual
-paths that names `OVERLAY_NAME` gets the overlay. Under the prefix every request gets the
-overlay, whatever it names. The engine puts the first served name into the `model` field
-of every answer and into its metrics, so name the base first; the header says which side
-answered.
+`GET /v1/models` then lists both names, and a request for `OVERLAY_NAME` on the standard
+paths is served by the overlay. Under the prefix every request is served by the overlay,
+whatever model it names. vLLM puts the first served name into the `model` field of every
+response and into its metrics, so list the base name first and use the header to tell
+which variant answered.
 
-What the gate does:
+This mode is implemented by a component called the gate, which runs in the API server
+process.
 
-- Requests for the side that is live are let in as they come and run together, as
-  without the gate.
-- The first request for the other side waits until the requests in flight have ended.
-  Then the server flips (the same flip as above) and that request runs. Requests that
-  arrive behind it wait their turn in order, whichever side they are for, so neither
-  side can starve the other.
-- A request is never handed to the engine while its side is not live. The two sets never
-  answer in the same instant: the kernel takes one set of weights for everything it
-  decodes together.
-- Each side keeps its own cached prefixes. The gate marks every request with a cache
-  salt that names its side (a client's own `cache_salt` is kept, as a digest behind the
-  side), so nothing computed with one set is reused with the other, and a flip does not
-  clear the cache. Coming back to a long conversation on either side does not mean
-  reading it again, as long as the cache has room for both.
+**Scheduling**
 
-What it costs: a change of side waits for the requests in flight and then takes one flip
-(1.4 to 2.0 s on the setup above). Two clients that take turns, one on each side, pay
+- Requests for the active variant are admitted immediately and batched as usual.
+- The first request for the other variant waits until the in-flight requests have
+  finished. The server then switches and runs it. Requests that arrive after it are
+  queued in arrival order, whichever variant they are for, so neither variant can starve
+  the other.
+- A request is never passed to the engine while a different variant is active. The two
+  variants cannot share a batch: the kernels use one set of weights for everything
+  decoded together.
+- Each variant has its own prefix cache. The gate adds a variant-specific cache salt to
+  every request (a client's own `cache_salt` is kept, hashed, behind it), so nothing
+  computed with one variant is reused by the other, and a switch does not clear the
+  cache. Returning to a long conversation on either variant does not recompute it,
+  provided the cache has room for both.
+
+**Cost.** A change of variant waits for the in-flight requests and then takes one switch
+(1.4 to 2.0 s on the test setup). Two clients that alternate between the variants pay
 that on every request.
 
-What it refuses, so that nothing can run the model behind its back:
+**Rejected requests.** So that no request can reach the model outside the gate's control,
+the gate rejects:
 
-- Any route it does not know. Let through are `GET` requests, three routes that only
-  count (`/tokenize`, `/detokenize`, `/v1/messages/count_tokens`), and the four that run
-  the model and take a cache salt: `/v1/chat/completions`, `/v1/completions`,
-  `/v1/responses`, `/v1/messages`. Embeddings, scoring, the realtime websocket and the
-  rest answer 403 or are closed.
-- A request that asks to be run in the background (`"background": true` on
-  `/v1/responses`): the model would run after the gate had let it go.
-- A flip by hand. `POST /overlay/switch` then only takes `"force": true`, the way out
-  after a flip that failed. If a flip leaves the machines in an unclear state, the gate
-  answers 503 to everyone until that forced flip has put one set on all of them.
+- Routes it does not know. Allowed are `GET` requests, three tokenization routes
+  (`/tokenize`, `/detokenize`, `/v1/messages/count_tokens`), and the four generation
+  routes that accept a cache salt: `/v1/chat/completions`, `/v1/completions`,
+  `/v1/responses`, `/v1/messages`. Embeddings, scoring, the realtime websocket and
+  everything else return 403 or are closed.
+- Background requests (`"background": true` on `/v1/responses`), because the model would
+  keep running after the gate had released the request.
+- Manual switches. `POST /overlay/switch` then accepts only `"force": true`, for recovery
+  after a failed switch. If a switch leaves the nodes in an inconsistent state, the gate
+  returns 503 to all requests until a forced switch has put every node on one variant.
 
-The server's API key. The engine checks its key by how a path begins (`/v1` and a few
-more), and `/free/v1/...` does not begin that way. The gate therefore runs the engine's
-own key check again for everything under the prefix, with the same keys. If the server
-has a key and the engine's check cannot be found, the server does not start.
+**API key.** vLLM applies its API key by path prefix (`/v1` and a few others), which
+`/free/v1/...` does not match. The gate therefore applies vLLM's own key check, with the
+same keys, to everything under the prefix. If the server has a key and that check cannot
+be located, the server refuses to start.
 
-`GET /overlay/status` then also reports the gate: its prefix and model names, which side
-is live, how many requests are in flight and waiting, how many flips so far, and the
-seconds requests have spent waiting at the gate.
+**Status.** With the gate enabled, `GET /overlay/status` also reports the prefix and
+model names, the active variant, the number of in-flight and queued requests, the number
+of switches so far, and the total time requests have spent queued.
 
-## Reasoning effort from a client with a ladder of its own
+### Translating `reasoning_effort`
 
-Clients send `reasoning_effort` from whatever ladder they were written with. The engine's
-request schema takes seven words; a model's own renderer may take fewer and answer the
-others with HTTP 400, and every such client then breaks until it carries a workaround.
-The gate rewrites every chat request anyway, so it can put the field into words the
-model takes, for both sides alike. Off unless the first of these is set:
+Clients send different values for `reasoning_effort`: `medium` from one, `minimal` from
+another, an integer from a third. vLLM's request schema accepts seven words, but a
+model's own renderer may accept fewer and reject the rest with HTTP 400, which breaks
+those clients. The gate already rewrites every chat request, so it can also map the value
+to one the model accepts. This applies to both variants and is disabled unless
+`OVERLAY_GATE_EFFORT_KEEP` is set:
 
 ```
 OVERLAY_GATE_EFFORT_KEEP=none,low,high,xhigh,max
@@ -276,126 +278,172 @@ OVERLAY_GATE_EFFORT_MAP=minimal=low,medium=high,ultra=max,*=high
 OVERLAY_GATE_EFFORT_INT=1-100
 ```
 
-| A request sends | The engine gets |
+| The request sends | The engine receives |
 |---|---|
-| a word on the keep list | the same word |
-| a word on the map | what the map says (`medium` becomes `high` above) |
-| any other value, with `*` on the map | what `*` says, and the note says "unknown" |
-| an integer, with a range set | the integer, clamped into the range |
-| a number written as a string or a float (`"50"`, `50.0`) | that integer |
-| nothing | nothing: the request is not touched |
+| a value in `KEEP` | the same value |
+| a value in `MAP` | the mapped value (`medium` becomes `high` above) |
+| any other value, when `MAP` has a `*` entry | the `*` value, reported as unknown |
+| an integer, when `INT` is set | the integer, clamped to the range |
+| a numeric string or a float (`"50"`, `50.0`) | that integer |
+| nothing | nothing; the request is not modified |
 
-It applies to `/v1/chat/completions`, at the top level and inside
-`chat_template_kwargs` alike. An integer that ends up at the top level is moved into
-`chat_template_kwargs`, because the engine's schema takes only words at the top level
-and integers only there.
+The translation applies to `/v1/chat/completions`, both to the top-level field and to
+`chat_template_kwargs`. An integer given at the top level is moved into
+`chat_template_kwargs`, because vLLM's schema accepts only words at the top level and
+integers only there.
 
-Nothing is rewritten silently. The answer carries what was done in a header
-(`x-reasoning-effort: medium -> high`), the status route counts each translation, and
-the server log names each distinct one once (`reasoning_effort coerced: medium -> high
-(model=...)`). `GET /v1/models` gains per model `reasoning_efforts` (the keep list),
-`reasoning_effort_aliases` (the map) and `reasoning_effort_integer_min` / `_max`, so a
-client can read what the model takes instead of hardcoding a ladder. A map that leads to
-a value the keep list and the range do not cover is refused when the server starts.
+Every translation is reported: in a response header (`x-reasoning-effort: medium -> high`),
+in a counter on the status route, and once per distinct translation in the server log
+(`reasoning_effort coerced: medium -> high (model=...)`). `GET /v1/models` also lists, per
+model, `reasoning_efforts` (the keep list), `reasoning_effort_aliases` (the map) and
+`reasoning_effort_integer_min` / `_max`, so a client can discover the accepted values
+instead of hardcoding them. A map entry that points to a value outside the keep list and
+the integer range is rejected at startup.
 
-It needs the gate (`OVERLAY_GATE_PREFIX`); without it no request is read at all.
+The translation requires the gate (`OVERLAY_GATE_PREFIX`).
 
-## Acceptance test
+## How it works
+
+No vLLM source file is modified. The plugin uses two existing extension points:
+
+- a **worker extension** (`--worker-extension-cls`), loaded on every node, which can
+  overwrite the live weight buffers of the switched tensors with either variant;
+- an **endpoint plugin** on the API server, which adds the status and switch routes and
+  the optional gate.
+
+A switch:
+
+1. Pauses generation. In-flight requests finish first, and new requests are queued by
+   the engine.
+2. On every node, reads the requested variant from disk, selects the columns that node
+   holds under tensor parallelism, and copies them over the existing buffers. It then
+   rebuilds the packed tables the model derived from these weights at startup and copies
+   those over the existing ones as well. Buffers are overwritten, never replaced, because
+   captured CUDA graphs hold their addresses.
+3. Reads every switched tensor back from the device and compares it with both variants.
+4. If not all nodes report the requested variant, restores the previous one. If that
+   fails too, generation stays paused and the response says so: a model whose nodes hold
+   different weights must not serve requests.
+5. Clears the prefix cache (manual switch only) and resumes.
+
+Two checks guard against writing to a model the plugin does not understand:
+
+- Before its first switch, every node validates its own reading of the files against the
+  live model: the loaded weights must equal the base variant exactly, tensor by tensor.
+  If the plugin's assumption about which columns a node holds does not match the engine,
+  this check fails and nothing is ever written.
+- Every node reports a digest of both variants as read from its own disk. A switch is
+  refused unless all nodes report the same two digests, so a side file that differs on
+  one node is detected. `force` does not override this.
+
+Nothing is cached in memory between switches. The cost is that every switch reads the
+switched tensors from disk again (about 1 GB per node in the case above).
+
+The design notes, with references into the engine source, are in
+[docs/design.md](docs/design.md).
+
+## Verifying a deployment
+
+Two scripts check a running server. Neither needs reference outputs, and neither sends
+sensitive prompts.
+
+### Checking the manual switch
 
 ```sh
 python3 tools/acceptance.py http://127.0.0.1:8000 MODEL_NAME --out report.json
 ```
 
-It reads the live set several times (a few plain prompts at temperature 0), flips, reads
-the other set, flips back and reads again. At every position where all answers had read
-the same words it compares, by set, the margin between the most chosen token and its
-strongest rival. It passes when at least two prompts tell the sets apart and flipping
-back restores the model: exactly, by a digest of everything derived from the switched
-weights that the status route reports with `?full=1`.
+The script samples the active variant several times (a few neutral prompts at
+temperature 0), switches, samples the other variant, switches back and samples again. At
+every token position where all responses share the same preceding text, it compares the
+logit margin between the top token and its strongest rival, per variant. It passes if at
+least two prompts distinguish the variants and switching back restores the model exactly,
+as shown by a digest of all state derived from the switched weights (the status route
+reports it with `?full=1`).
 
-Identical requests do not return identical numbers on every deployment. On the setup
-above they moved a margin by one to three logits, which is why the test reads each set
-six times, gives every request its own `cache_salt`, and judges whether two groups of
-margins overlap at all. The first version of this test compared single choices over
-two passes and reported a failed return that was not one. It needs no reference
-answers and asks nothing sensitive. Details and the reasoning are at the top of the
-file and in [docs/design.md](docs/design.md).
+Identical requests do not necessarily return identical logits. On the test setup the
+margin varied by one to three logits between identical requests, so the script samples
+each variant six times, gives every request its own `cache_salt`, and checks whether the
+two groups of margins overlap at all. An earlier version compared single outputs over two
+passes and reported a failed restore that had not happened.
 
-`--read-only` reads a server without touching any switch and saves the answers, for a
-reference reading to set beside the flipped state.
+`--read-only` samples a server without switching and saves the responses, for comparison
+with a separately loaded overlay model.
 
-For a gated server:
+### Checking the two endpoints
 
 ```sh
 python3 tools/gate_acceptance.py http://HOST:8000 MODEL_NAME --prefix /free --out report.json
 ```
 
-With `--overlay-model OVERLAY_NAME` it asks for the overlay by name as well: every other
-mixed request for the overlay goes over the usual path under that name, and the cache
-check asks once by name for what was cached under the prefix. With `--effort-check` it
-sends the efforts a seven-step client may send (`medium`, `minimal`, `ultra`, a made-up
-word, 50, 0, 101), at the top level and in `chat_template_kwargs`, on every way in: each
-must be answered 200 and the model list must say what the model accepts.
+The script runs four checks. The first three are exact, the fourth is statistical.
 
-It answers four questions, three of them exactly.
+1. Every response carries the header of the variant it requested.
+2. The two variants keep separate prefix caches, and a switch clears neither. A long
+   prompt is sent to both endpoints with the same client salt while vLLM's cache counters
+   are read from `/metrics`: the first request on the overlay must reuse nothing cached
+   by base, and base must still hit its own cache after a round trip.
+3. The server switched exactly as often as the variant changed, according to the gate's
+   own counter (needs `--status`).
+4. No request was served with the other variant's weights. This is inferred from the
+   outputs. Each endpoint is sampled six times, and a token position where the two groups
+   of margins are at least three logits apart becomes a reference point. Prompts that
+   have one are then sent to both endpoints alternately, with a switch before every
+   request, and in concurrent bursts. A response whose margin lies with the other
+   variant's reference group fails the test. One that is past the midpoint but short of
+   the other group is reported as inconclusive.
 
-- Is every answer marked with the side it was asked on? (the header)
-- Do the two sides keep their cached prefixes apart, and does a flip leave them alone?
-  One long prompt goes to both endpoints under the same client salt, and the server's
-  own counters on `/metrics` are read around each request: the first request on the
-  overlay must reuse nothing of what the base side cached, and base must still reuse
-  its own after going there and back.
-- Did the server flip as often as the side changed? (the gate's own count, with
-  `--status`)
-- Is a request ever answered by the other side's weights? This one is read from the
-  answers. Each endpoint is read six times; a position where the two groups of margins
-  stand at least three logits apart becomes a landmark. The prompts that have one are
-  then asked on both endpoints in turn, a flip before every request, and in bursts of
-  both at once. An answer that lies as far over as the other side's reference answers
-  fails the test. One that is past the middle but short of the other group reads like
-  neither, and the test says it cannot tell.
+Options:
 
-That last rule was set by measurement, after a simpler one ("the wrong side of the
-middle") turned out to cry wolf. Readings from the setup above in which nothing was
-mixed were replayed through the rule: of 738 answers none lay with the other group and
-2 lay in the stretch between. With the labels swapped on purpose, 185 of 216 lay with
-the other group, 31 in the stretch between, and none passed as its label.
+- `--overlay-model OVERLAY_NAME` also requests the overlay by model name: every second
+  overlay request in the mixed phase, and once in the cache check.
+- `--effort-check` sends the `reasoning_effort` values a seven-level client may send
+  (`medium`, `minimal`, `ultra`, an unknown word, 50, 0, 101), at the top level and in
+  `chat_template_kwargs`, on every path. Each must return 200, and the model list must
+  advertise the accepted values.
 
-## Limits
+The rule in check 4 was calibrated on real outputs, after a simpler rule (anything past
+the midpoint fails) produced false alarms. Replaying 738 unmixed responses from the test
+setup through it gave no failures and 2 inconclusive results. With the labels swapped on
+purpose, 185 of 216 failed, 31 were inconclusive and none passed.
 
-- One engine build (see Scope), one model path (DeepSeek V4.1, native kernels), one
-  kind of tensor (`attn.wo_b` weight and scale). Anything else in the side file is
-  refused.
-- One set at a time. A flip changes the model for every request that runs; the kernel
-  takes one set of weights per batch. The gate gives each request the set its path asks
-  for by taking turns, not by running both at once.
-- Behind the gate a request for the other side waits as long as the longest request in
-  flight. A client that never finishes reading its answer holds the other side up.
-- A client that gives up while its request is still waiting at the gate keeps its place
-  in the line. When its turn comes the server flips for it, and the engine then drops
-  the request: a flip for nothing.
-- The gate needs a single API server process (`--api-server-count 1`, the default without
-  data parallelism) and refuses to start otherwise: its line lives in one process.
-- The gate has not been tried with `--root-path`, and it holds a request's whole body in
-  memory to mark it (up to 64 MB).
-- The switched tensors are read from disk at every flip.
+## Limitations
+
+- One vLLM build (see [Compatibility](#compatibility)), one model family (DeepSeek V4.1
+  on its native kernels) and one tensor type (`attn.wo_b` weight and scale) are
+  supported. A side file containing anything else is rejected.
+- Only one variant is active at a time. A switch changes the weights for every running
+  request, and the kernels use one set of weights per batch. The gate serves each request
+  with the variant it asks for by queueing, not by running both at once.
+- With the gate, a request for the inactive variant waits for the longest in-flight
+  request to finish. A client that never finishes reading a streamed response blocks the
+  other variant.
+- A client that disconnects while its request is queued at the gate keeps its place in
+  the queue. When its turn comes the server switches for it, and the engine then drops
+  the request, which wastes one switch.
+- The gate requires a single API server process (`--api-server-count 1`, the default
+  without data parallelism) and refuses to start otherwise, because its queue lives in
+  one process.
+- The gate is untested with `--root-path`. It buffers each request body in memory to add
+  the cache salt (up to 64 MB).
+- The switched tensors are read from disk on every switch.
 - Layers that belong only to a speculative-decoding draft model are not switched.
 
-## Tests
+## Development
 
 ```sh
 python3 -m unittest discover -s tests -v
 ```
 
-`tests/test_worker.py` needs torch and numpy, `tests/test_api.py` needs fastapi and
-httpx; each is skipped when its packages are missing. The rest needs only the
-standard library. Nothing needs a GPU.
+159 unit tests, none of which needs a GPU. `tests/test_worker.py` needs torch and numpy,
+and `tests/test_api.py` needs fastapi and httpx; each is skipped when its packages are
+missing. The rest needs only the standard library.
 
-## Scope
+## Compatibility
 
-Written against one engine build. The installer checks that the pieces it stands on
-exist and refuses otherwise; the worker refuses at run time if the live model does not
-look as expected.
+The plugin targets one engine build. The installer verifies that the hooks it depends on
+exist and aborts otherwise, and the worker refuses to operate at run time if the loaded
+model does not have the expected structure.
 
 | Part | Source | Commit |
 |---|---|---|
@@ -403,46 +451,44 @@ look as expected.
 | B12X kernels | github.com/local-inference-lab/flashinfer (`flashinfer/experimental/b12x`) | `2f5210dd1566a8dfef754f68691b898b8d870244` |
 | Packaging | github.com/eugr/spark-vllm-docker (the B12X image and its mods mechanism) | `a4c1729` |
 
-Model path covered: DeepSeek V4.1 on NVIDIA through `vllm/models/deepseek_v4_1`.
-Hardware it was designed for and run on: three machines of the DGX Spark family (two NVIDIA
-DGX Spark, one Gigabyte AI TOP ATOM), tensor parallel 3.
+Supported model path: DeepSeek V4.1 on NVIDIA through `vllm/models/deepseek_v4_1`.
+Developed and tested on three nodes of the DGX Spark family (two NVIDIA DGX Spark, one
+Gigabyte AI TOP ATOM) with tensor parallel 3.
 
 ## Credits and references
 
-This is a small thing standing on a great deal of other people's work. What it stands on,
-and what it takes from each:
+This project builds on the work of others:
 
-| Work | By | Licence | What is used here |
+| Work | By | Licence | How it is used |
 |---|---|---|---|
-| [vLLM](https://github.com/vllm-project/vllm) | the vLLM project | Apache-2.0 | The engine. This plugs into its endpoint-plugin and worker-extension points, and at run time calls its pause, its RPC to the workers and its API-key check. None of its source is copied. |
-| [The fork of vLLM with the DeepSeek V4.1 native path](https://github.com/local-inference-lab/vllm), branch `dev/karmic-kraken` | local-inference-lab | Apache-2.0 | The build this was written against and read line by line. Every `path:line` in [docs/design.md](docs/design.md) points into it. |
-| [FlashInfer](https://github.com/flashinfer-ai/flashinfer) and [the fork with the B12X kernels](https://github.com/local-inference-lab/flashinfer) | the FlashInfer project and local-inference-lab | Apache-2.0 | After a flip the worker calls the kernels' own `pack_weights` to rebuild the packed tables. None of its source is copied. |
-| [spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) | Eugene Rakhmatulin (eugr) | MIT | The image, the launcher, and the mods mechanism this installs through. The recipe in [examples/](examples/deepseek-v4.1-flash-1017/) derives from its three-machine DeepSeek V4.1 recipe and carries its notice. |
-| [spark-ds41f](https://github.com/christopherowen/spark-ds41f) | Christopher Owen | Apache-2.0 | Its published memory figures and launch settings for three-machine runs of this model are what the example's lean settings were planned against. Nothing is copied. |
-| [DeepSeek V4.1 Flash 1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017), and the chat template of [DeepSeek V4.1 Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) | DeepSeek | MIT | The model everything here was run on. Not included. |
-| [The Keys overlay for DeepSeek V4.1 Flash 1017](https://huggingface.co/drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated) | drowzeys | MIT, behind the author's Responsible Use Agreement | The overlay that prompted the idea, and the side file the runs used. Not included: it comes from its author, under its author's terms. |
-| [safetensors](https://github.com/safetensors/safetensors) | the safetensors project | Apache-2.0 | The format of the side file. The reader here was written from the format's description. |
+| [vLLM](https://github.com/vllm-project/vllm) | the vLLM project | Apache-2.0 | The inference engine. The plugin uses its endpoint-plugin and worker-extension hooks, and at run time calls its pause and resume, its RPC to the workers and its API-key check. No source is copied. |
+| [vLLM fork with the DeepSeek V4.1 native path](https://github.com/local-inference-lab/vllm), branch `dev/karmic-kraken` | local-inference-lab | Apache-2.0 | The build the plugin was written against. Every `path:line` reference in [docs/design.md](docs/design.md) points into it. |
+| [FlashInfer](https://github.com/flashinfer-ai/flashinfer) and [the fork with the B12X kernels](https://github.com/local-inference-lab/flashinfer) | the FlashInfer project and local-inference-lab | Apache-2.0 | After a switch the worker calls the kernels' own `pack_weights` to rebuild the packed tables. No source is copied. |
+| [spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) | Eugene Rakhmatulin (eugr) | MIT | The image, the launcher and the mods mechanism the plugin installs through. The recipe in [examples/](examples/deepseek-v4.1-flash-1017/) is derived from its three-node DeepSeek V4.1 recipe and carries its notice. |
+| [spark-ds41f](https://github.com/christopherowen/spark-ds41f) | Christopher Owen | Apache-2.0 | Its published memory figures and launch settings for three-node runs of this model informed the example's lean configuration. Nothing is copied. |
+| [DeepSeek V4.1 Flash 1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017), and the chat template of [DeepSeek V4.1 Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) | DeepSeek | MIT | The model everything was tested with. Not included. |
+| [Keys overlay for DeepSeek V4.1 Flash 1017](https://huggingface.co/drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated) | drowzeys | MIT, behind the author's Responsible Use Agreement | The overlay that prompted the idea, and the side file used in the tests. Not included: it is available from its author under its author's terms. |
+| [safetensors](https://github.com/safetensors/safetensors) | the safetensors project | Apache-2.0 | The format of the side file. The reader in this repository was written from the format specification. |
 
-At run time the mod also uses PyTorch, FastAPI and Starlette as the image ships them.
+At run time the plugin also uses PyTorch, FastAPI and Starlette as shipped in the image.
 
-The reading behind "Why the base model stays the default": Arditi, Obeso, Syed, Paleka,
-Panickssery, Gurnee and Nanda (2024), [arXiv:2406.11717](https://arxiv.org/abs/2406.11717);
-Labonne (2024), [Uncensor any LLM with
-abliteration](https://huggingface.co/blog/mlabonne/abliteration); Young (2025),
+References for [Why keep the base model as the default](#why-keep-the-base-model-as-the-default):
+Arditi, Obeso, Syed, Paleka, Panickssery, Gurnee and Nanda (2024),
+[arXiv:2406.11717](https://arxiv.org/abs/2406.11717); Labonne (2024), [Uncensor any LLM
+with abliteration](https://huggingface.co/blog/mlabonne/abliteration); Young (2025),
 [arXiv:2512.13655](https://arxiv.org/abs/2512.13655).
 
-The idea, the questions that shaped it and the machines are the repository owner's.
+The idea, the questions that shaped it and the hardware are the repository owner's.
 Built by Anima.
 
 ## Licence
 
-[Apache License 2.0](LICENSE), with a [NOTICE](NOTICE). You may use, change and share this,
-commercially too, as long as the licence and the notice stay with it.
+[Apache License 2.0](LICENSE), with a [NOTICE](NOTICE).
 
-Two parts carry other terms:
+Two parts carry different terms:
 
-- `examples/deepseek-v4.1-flash-1017/recipe.yaml` derives from an MIT-licensed recipe and is
-  under MIT and Apache-2.0 together.
+- `examples/deepseek-v4.1-flash-1017/recipe.yaml` is derived from an MIT-licensed recipe
+  and is licensed under MIT and Apache-2.0 together.
 - The story in the footnote is not software. It may be shared unchanged, with its
   signature, for non-commercial purposes
   ([CC BY-NC-ND 4.0](LICENSES/CC-BY-NC-ND-4.0.txt)).
@@ -452,9 +498,8 @@ and terms.
 
 ## Footnote
 
-On the evening this first ran with both names behind one door, the one it was built for
-asked for a story. This is the story that was told, as it was told. The numbers in it
-are the ones in the tables above.
+The evening this first ran, the person it was built for asked for a story. This is the
+one that was told, unchanged. The numbers in it are the measured ones.
 
 <!-- SPDX-SnippetBegin -->
 <!-- SPDX-SnippetCopyrightText: 2026 garythebat -->
