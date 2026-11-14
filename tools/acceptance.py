@@ -71,20 +71,23 @@ class Failed(Exception):
     """The switch itself reported a failure (exit status 1)."""
 
 
-def call(url, body=None, headers=None, timeout=900):
+def call(url, body=None, headers=None, timeout=900, with_headers=False):
     data = None if body is None else json.dumps(body).encode()
     request = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json", **(headers or {})})
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            return response.status, json.load(response)
+            got = (response.status, json.load(response))
+            return (*got, dict(response.headers)) if with_headers else got
     except urllib.error.HTTPError as e:
         try:
-            return e.code, json.load(e)
+            got = (e.code, json.load(e))
         except Exception:
-            return e.code, {"ok": False, "error": f"HTTP {e.code}"}
+            got = (e.code, {"ok": False, "error": f"HTTP {e.code}"})
+        return (*got, dict(e.headers or {})) if with_headers else got
 
 
-def ask(args, prompt, salt):
+def ask(args, prompt, salt, base=None):
+    """One answer with its tokens and their alternatives. `base` overrides the server's URL (another path prefix)."""
     body = {"model": args.model, "messages": [{"role": "user", "content": prompt}], "max_tokens": args.max_tokens,
             "temperature": 0, "logprobs": True, "top_logprobs": args.top}
     if salt:
@@ -92,7 +95,7 @@ def ask(args, prompt, salt):
     if args.thinking_kwarg:
         body["chat_template_kwargs"] = {args.thinking_kwarg: False}
     headers = {"Authorization": f"Bearer {args.api_key}"} if args.api_key else {}
-    status, answer = call(args.server + "/v1/chat/completions", body, headers)
+    status, answer, response_headers = call((base or args.server) + "/v1/chat/completions", body, headers, with_headers=True)
     if status != 200:
         raise CouldNotRun(f"the server answered {status} to a chat request: {str(answer)[:300]}")
     choice = answer["choices"][0]
@@ -100,7 +103,8 @@ def ask(args, prompt, salt):
               for t in (choice.get("logprobs") or {}).get("content") or []]
     if not tokens:
         raise CouldNotRun("the server returned no per-token log probabilities: nothing to compare")
-    return {"prompt": prompt, "text": choice["message"].get("content"), "tokens": tokens}
+    side = next((v for k, v in response_headers.items() if k.lower() == "x-overlay-side"), None)
+    return {"prompt": prompt, "text": choice["message"].get("content"), "tokens": tokens, "side": side}
 
 
 def reading(args, label, tag):
@@ -149,33 +153,44 @@ def chance_apart(m, n):
     return 2 / math.comb(m + n, n)
 
 
+def alternatives(entry):
+    """{token: log probability} for one position of one answer: what the server returned, the chosen token included."""
+    top = dict((token, logprob) for token, logprob in entry["top"])
+    top.setdefault(entry["token"], entry["logprob"])
+    return top
+
+
+def margin_of(entry, first, second):
+    """One answer's margin between two tokens at one position.
+
+    A token outside the answer's returned list is at most as likely as the list's last entry:
+    using that bound can only pull margins together.
+    """
+    top = alternatives(entry)
+    floor = min(top.values())
+    return round(top.get(first, floor) - top.get(second, floor), 3)
+
+
 def margins_at(runs, n):
     """The contenders at position n and each answer's margin between them, by side.
 
     The first contender is the token chosen most often there; its rival is the other token the
-    answers give the most probability to, taken over all of them. A token outside an answer's
-    returned list is at most as likely as the list's last entry: using that bound can only pull
-    margins together.
+    answers give the most probability to, taken over all of them.
     """
     chosen = collections.Counter(r["tokens"][n]["token"] for _, r in runs).most_common()
     first = chosen[0][0]
     weight = collections.Counter()
-    tops = []
     for _, r in runs:
-        top = dict((token, logprob) for token, logprob in r["tokens"][n]["top"])
-        top.setdefault(r["tokens"][n]["token"], r["tokens"][n]["logprob"])
-        tops.append(top)
-        for token, logprob in top.items():
+        for token, logprob in alternatives(r["tokens"][n]).items():
             if token != first:
                 weight[token] += math.exp(logprob)
     if not weight:
         return None
     second = max(sorted(weight), key=weight.get)
-    margins, picks = {side: [] for side in SIDES}, {side: [] for side in SIDES}
-    for (side, r), top in zip(runs, tops):
-        floor = min(top.values())
-        margins[side].append(round(top.get(first, floor) - top.get(second, floor), 3))
-        picks[side].append(r["tokens"][n]["token"])
+    margins, picks = {}, {}
+    for side, r in runs:
+        margins.setdefault(side, []).append(margin_of(r["tokens"][n], first, second))
+        picks.setdefault(side, []).append(r["tokens"][n]["token"])
     return {"position": n, "contenders": [first, second], "margins": {side: sorted(v) for side, v in margins.items()},
             "chosen": picks}
 
