@@ -27,11 +27,15 @@ class FakeEngine:
         self.pause_raises = pause_raises
         self.calls = []
         self.paused = False
+        self.sets = None      # per rank: what each says it read from its own disk
 
     async def collective_rpc(self, method, timeout=None, args=(), kwargs=None):
         self.calls.append((method, *args))
         if method == "overlay_status":
-            return [{"ok": True, "rank": r, "prepared": self.prepared, "active": a} for r, a in enumerate(self.active)]
+            out = [{"ok": True, "rank": r, "prepared": self.prepared, "active": a} for r, a in enumerate(self.active)]
+            for r, sets in enumerate(self.sets or []):
+                out[r]["sets"] = sets
+            return out
         if method == "overlay_prepare":
             bad = self.fail.get(("overlay_prepare", None), ())
             self.prepared = not bad
@@ -158,6 +162,19 @@ class Flip(unittest.TestCase):
         self.assertEqual((status, answer["ok"], answer["paused"]), (500, False, True))
         self.assertEqual([c for c in e.calls if c[0] == "overlay_switch"], [("overlay_switch", "base")])
         self.assertNotIn(("resume",), e.calls)
+
+    def test_ranks_that_read_different_files_are_never_flipped_not_even_by_force(self):
+        same = {"base": "aaaa", "overlay": "bbbb"}
+        for force in (False, True):
+            e = FakeEngine()
+            e.sets = [same, same, {"base": "aaaa", "overlay": "cccc"}]
+            answer, status = run(e, "overlay", force=force)
+            self.assertEqual((status, answer["ok"]), (500, False))
+            self.assertIn("do not read the same files", answer["error"])
+            self.assertEqual(e.calls, [("overlay_status",)])
+        e = FakeEngine()
+        e.sets = [same, same, same]
+        self.assertEqual(run(e, "overlay")[1], 200)
 
     def test_force_cannot_make_an_unprepared_rank_write(self):
         e = FakeEngine(prepared=False, fail={("overlay_prepare", None): (1,)})

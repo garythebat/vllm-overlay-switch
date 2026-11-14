@@ -230,6 +230,23 @@ class Prepare(WorkerCase):
             self.assertEqual((out["layers"], out["checked"], out["match"]), (3, 6, {"base": 6, "overlay": 0}))
             self.assertEqual(out["file"], "side.safetensors")
 
+    def test_every_rank_reports_the_same_digest_of_the_whole_files_and_a_changed_file_shows(self):
+        first = [self.worker(rank).overlay_prepare()["sets"] for rank in range(RANKS)]
+        self.assertEqual(first[0], first[1])
+        self.assertEqual(first[1], first[2])
+        self.assertEqual(sorted(first[0]), ["base", "overlay"])
+        self.assertNotEqual(first[0]["base"], first[0]["overlay"])
+        # one byte differs in the side file, in columns that rank 0 does not hold
+        key = (SWITCHED[1], "weight")
+        changed = bytearray(self.data["overlay"][key])
+        changed[FILE_COLS - 1] ^= 0xFF
+        self.data["overlay"][key] = bytes(changed)
+        self.write_side(SWITCHED)
+        other = self.worker(0).overlay_prepare()
+        self.assertEqual((other["ok"], other["active"]), (True, "base"))      # rank 0 alone would see nothing wrong
+        self.assertEqual(other["sets"]["base"], first[0]["base"])
+        self.assertNotEqual(other["sets"]["overlay"], first[0]["overlay"])
+
     def test_the_cut_matches_what_the_loader_left_including_the_padded_rank(self):
         worker = self.worker(2)
         worker.overlay_prepare()

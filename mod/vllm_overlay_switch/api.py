@@ -26,7 +26,7 @@ import asyncio
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from .logic import PAUSE_MODES, STATUS_TIMEOUT_S, VARIANTS, agree, flip, refusal
+from .logic import PAUSE_MODES, STATUS_TIMEOUT_S, VARIANTS, agree, flip, refusal, same_files
 
 
 class OverlaySwitchEndpointPlugin:
@@ -52,6 +52,8 @@ class OverlaySwitchEndpointPlugin:
             except Exception as e:  # the extension is missing, or a rank did not answer
                 return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"[:400]}, status_code=500)
             same, why_not = agree(ranks)
+            if same:
+                same, why_not = same_files(ranks)
             return JSONResponse({"ok": same, "error": why_not or None, "paused": paused,
                                  "active": ranks[0].get("active") if same else None, "ranks": ranks})
 

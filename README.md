@@ -59,6 +59,10 @@ live model: it must find the live weights to be exactly the base set, tensor by 
 If this tool's idea of which columns a machine holds did not fit the engine in front of
 it, that proof fails and nothing is ever written.
 
+Every machine also reports a digest of the whole of both sets as it read them from its
+own disk. A flip is refused unless all machines report the same two digests, so a side
+file that differs on one machine cannot go unnoticed. `force` does not override this.
+
 Nothing is held in memory between flips. The price is that a flip reads the switched
 tensors from disk each time (about a gigabyte per machine for the case above).
 

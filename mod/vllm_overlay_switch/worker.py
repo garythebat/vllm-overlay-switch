@@ -24,6 +24,8 @@ Two things are checked, not assumed:
   tensor by tensor. If this tool's idea of which columns a rank holds were wrong for the
   engine in front of it, the live weights would match neither set and it refuses to write.
 - After a flip, every tensor is read back from the device and compared again.
+- Every rank reports a digest of the whole of both sets as it read them from its own disk. The
+  HTTP half refuses to flip unless all ranks report the same two digests.
 
 Which set is active is read from the live weights, never remembered (the one exception: a
 rank on whose columns the two sets do not differ reports the set it wrote last).
@@ -247,21 +249,40 @@ def _prepare(worker) -> dict:
             raise ValueError(f"{entry.name}: the file has too few columns for this rank and padding is off")
         cut[(layer, kind)] = (start, have)
 
+    # Read both sets once. From each tensor: a fingerprint of this rank's columns (to tell which
+    # set is live), and its whole bytes into one digest per set, so that the ranks can show each
+    # other they read the same files. A rank sees only its own columns of the live model; without
+    # the whole-file digest, a side file that differed on one machine would go unnoticed.
     sources = {"base": base, "overlay": overlay}
-    prints = {v: {key: _print(_cut(sources[v][key], *cut[key])) for key in keys} for v in VARIANTS}
+    prints, ids = {}, {}
+    for v in VARIANTS:
+        whole, prints[v] = hashlib.sha256(), {}
+        for key in keys:
+            entry = sources[v][key]
+            raw = stfile.read_bytes(entry)
+            whole.update(f"{entry.name}\0{entry.dtype}\0{entry.shape}\0".encode())
+            whole.update(raw)
+            prints[v][key] = _print(_columns(raw, entry, *cut[key]))
+            del raw
+        ids[v] = whole.hexdigest()[:16]
     if all(prints["base"][key] == prints["overlay"][key] for key in keys):
         raise ValueError("the two sets do not differ on this rank's columns: is the served checkpoint the base one?")
     ends = sorted({layers[0], layers[-1]})
     return {"layers": layers, "keys": keys, "probe_keys": [(layer, kind) for layer in ends for kind in KINDS],
-            "sources": sources, "cut": cut, "prints": prints, "side": side_path, "last": "base"}
+            "sources": sources, "cut": cut, "prints": prints, "ids": ids, "side": side_path, "last": "base"}
+
+
+def _columns(raw: bytearray, entry: stfile.Entry, start: int, have: int):
+    """This rank's columns out of a file tensor's bytes, as contiguous bytes on the CPU."""
+    import torch
+
+    whole = torch.frombuffer(raw, dtype=torch.uint8).view(entry.shape)
+    return whole[:, start:start + have].contiguous()
 
 
 def _cut(entry: stfile.Entry, start: int, have: int):
-    """This rank's columns of a file tensor, as contiguous bytes on the CPU."""
-    import torch
-
-    whole = torch.frombuffer(stfile.read_bytes(entry), dtype=torch.uint8).view(entry.shape)
-    return whole[:, start:start + have].contiguous()
+    """Read a file tensor and keep this rank's columns."""
+    return _columns(stfile.read_bytes(entry), entry, start, have)
 
 
 def _live(attn, kind: str, have: int):
@@ -295,6 +316,7 @@ def _report(worker, state: dict, *, full: bool, wrote: str | None = None) -> dic
         active = "mixed"
     ok = active in VARIANTS
     return {"ok": ok, "active": active, "layers": len(state["layers"]), "checked": len(keys), "match": match,
+            "sets": dict(state["ids"]),
             "error": None if ok else f"the live weights match neither set (base {match['base']}, "
                                      f"overlay {match['overlay']} of {len(keys)} tensors)"}
 

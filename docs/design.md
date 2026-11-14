@@ -110,7 +110,11 @@ public API port. This project does not enable developer mode.
    already points at the side file, stop: the server must be started on the base.
 3. For each tensor, work out which columns this rank holds (point 4 above) and check
    rows, types and one-byte elements against the live Parameter.
-4. Read both sets from disk and fingerprint this rank's columns of every tensor.
+4. Read both sets from disk. Fingerprint this rank's columns of every tensor, and digest
+   the whole of each set. A rank sees only its own columns of the live model, so the
+   whole-set digests are what lets the ranks show each other they read the same files;
+   the HTTP half compares them and refuses to flip if they differ, with or without
+   `force`.
 5. **Prove the cut**: fingerprint the same columns of every live tensor. They must all
    match one set. If they match neither, this tool's reading of the layout does not fit
    the engine in front of it; the rank stays unprepared and will not write, whatever it

@@ -55,6 +55,23 @@ def all_prepared(results: list[Any]) -> bool:
     return isinstance(results, list) and bool(results) and all(isinstance(r, dict) and r.get("prepared") for r in results)
 
 
+def same_files(results: list[Any]) -> tuple[bool, str]:
+    """Did every prepared rank read the same two sets from its own disk?
+
+    A rank can only compare the live weights with its own columns of the files. If the side file
+    differed on one machine, each rank would still find itself consistent. So every rank also
+    reports a digest of the whole of both sets, and they must all be equal.
+    """
+    seen = {}
+    for r in results if isinstance(results, list) else []:
+        if isinstance(r, dict) and r.get("prepared") and "sets" in r:
+            seen.setdefault(repr(sorted((r.get("sets") or {}).items())), []).append(r.get("rank"))
+    if len(seen) > 1:
+        groups = "; ".join(f"ranks {ranks} read {sets}" for sets, ranks in seen.items())
+        return False, f"the ranks do not read the same files ({groups})"
+    return True, ""
+
+
 async def flip(engine, variant: str, mode: str, force: bool = False) -> tuple[dict, int]:
     """Pause, copy on every rank, verify, resume. Returns (answer, HTTP status).
 
@@ -77,6 +94,9 @@ async def flip(engine, variant: str, mode: str, force: bool = False) -> tuple[di
             if not all_prepared(before):
                 _, why = agree(before)
                 return {"ok": False, "error": f"could not prepare the alternate set: {why}", "ranks": before}, 500
+        files_ok, files_why = same_files(before)
+        if not files_ok:      # not something force may override: the result would be a model split across files
+            return {"ok": False, "ranks": before, "error": f"refusing to flip: {files_why}"}, 500
         ok, why = agree(before)
         if not ok and not force:
             return {"ok": False, "ranks": before,
