@@ -1,35 +1,46 @@
 #!/usr/bin/env python3
 """Acceptance test for the overlay switch, against a running server. Standard library only.
 
-It asks nothing sensitive and needs no reference answers. Two models with different weights
-choose different next tokens at some point where both have read exactly the same words, and
-each repeats its own choice. So:
+It asks nothing sensitive and needs no reference answers. It answers two questions.
 
-  1. ask a handful of plain prompts at temperature 0, twice, on the set that is live (A);
-  2. flip to the other set (B) and ask again, twice;
-  3. flip back and ask again, twice.
+Does the model read what a flip wrote?
+    Two models with different weights weigh the next token differently at some point where
+    both have read exactly the same words. The live set (A) is read several times, then the
+    other set (B) after a flip, then A again after flipping back. For each prompt the answers
+    are walked token by token while they all agree; at the first place they part, every
+    answer was produced from an identical context. The two tokens most often chosen there
+    are the contenders, and each answer's margin is the log probability of the first minus
+    that of the second. A prompt tells the sets apart when every A margin lies on one side
+    and every B margin on the other.
 
-For each prompt the six answers are walked token by token while they all agree. At the first
-place they part, every answer has been produced from an identical context. The flip is shown
-to work when, at that place, all four A answers chose one token and both B answers another.
-If the two A readings (before and after) disagree with each other, flipping back did not
-restore the model.
+Does flipping back restore the model?
+    Exactly, when the switch offers it: a full status carries one digest per rank of every
+    tensor the model derived from the switched weights. It is read when the test begins and
+    when it ends, and the two must be equal on every rank. The weights themselves are read
+    back by the switch after every flip. Without that digest the answers have to do: A after
+    the return must not stand apart from A before.
 
-Two identical requests do not always return identical text on this kind of deployment, and
-wording drifts after a few tokens. That is why only the first parting is judged, and each
-set against its own repeat.
+Why margins and several passes. The same request does not return the same numbers twice on
+every deployment: kernels are chosen by timing, prefixes are cached, speculative tokens are
+verified in batches. On the first hardware this ran on, identical requests moved a margin by
+one to three logits. Two passes cannot tell that from a change of weights; five or more can.
+Each request carries its own cache salt, so no answer reuses another's cached prefix and the
+passes are independent.
 
 Run it where the switch accepts calls from (by default: on the machine the server runs on).
 
     python3 tools/acceptance.py http://127.0.0.1:8000 MODEL_NAME
-    python3 tools/acceptance.py http://127.0.0.1:8000 MODEL_NAME --out report.json --need 2
+    python3 tools/acceptance.py http://127.0.0.1:8000 MODEL_NAME --passes 8 --out report.json
 
 Exit status: 0 the flip is shown and the return restores; 1 it is shown not to work;
 2 these prompts cannot tell the two sets apart (not proof of anything); 3 could not run.
 """
 
 import argparse
+import collections
 import json
+import math
+import secrets
 import sys
 import time
 import urllib.error
@@ -46,6 +57,8 @@ PROMPTS = [
     "Write one sentence that begins with the word 'Although'.",
 ]
 OTHER = {"base": "overlay", "overlay": "base"}
+SIDES = ("A before", "B", "A after")
+MIN_PASSES = 4
 
 
 class CouldNotRun(Exception):
@@ -69,9 +82,11 @@ def call(url, body=None, headers=None, timeout=900):
             return e.code, {"ok": False, "error": f"HTTP {e.code}"}
 
 
-def ask(args, prompt):
+def ask(args, prompt, salt):
     body = {"model": args.model, "messages": [{"role": "user", "content": prompt}], "max_tokens": args.max_tokens,
-            "temperature": 0, "logprobs": True, "top_logprobs": 5}
+            "temperature": 0, "logprobs": True, "top_logprobs": args.top}
+    if salt:
+        body["cache_salt"] = salt          # a fresh computation: nothing cached under another salt is reused
     if args.thinking_kwarg:
         body["chat_template_kwargs"] = {args.thinking_kwarg: False}
     headers = {"Authorization": f"Bearer {args.api_key}"} if args.api_key else {}
@@ -86,16 +101,26 @@ def ask(args, prompt):
     return {"prompt": prompt, "text": choice["message"].get("content"), "tokens": tokens}
 
 
-def reading(args, label):
-    print(f"reading {label}: {args.passes} passes of {len(PROMPTS)} prompts")
-    return [[ask(args, prompt) for prompt in PROMPTS] for _ in range(args.passes)]
+def reading(args, label, tag):
+    print(f"reading {label}: {args.passes} passes of {len(PROMPTS)} prompts", flush=True)
+    return [[ask(args, prompt, None if args.no_cache_salt else f"{args.nonce}-{tag}-{k}-{i}")
+             for i, prompt in enumerate(PROMPTS)] for k in range(args.passes)]
 
 
 def status(args, full=False):
-    code, answer = call(args.switch + "/overlay/status" + ("?full=1" if full else ""), headers=args.switch_headers, timeout=120)
+    code, answer = call(args.switch + "/overlay/status" + ("?full=1" if full else ""), headers=args.switch_headers, timeout=300)
     if code != 200 or not answer.get("ok"):
         raise Failed(f"the switch's status call answered {code}: {str(answer)[:400]}")
     return answer
+
+
+def derived(answer):
+    """{rank: digest} from a full status, or {} when the switch does not offer it."""
+    out = {}
+    for r in answer.get("ranks") or []:
+        if isinstance(r, dict) and r.get("derived"):
+            out[str(r.get("rank"))] = r["derived"]
+    return out
 
 
 def flip(args, variant):
@@ -104,37 +129,56 @@ def flip(args, variant):
     took = round(time.monotonic() - started, 3)
     if code != 200 or not answer.get("ok") or answer.get("active") != variant:
         raise Failed(f"the flip to {variant!r} answered {code}: {str(answer)[:600]}")
-    print(f"flip to {variant}: {took} s as seen from here; the server's own timings: {answer.get('timings')}")
+    print(f"flip to {variant}: {took} s as seen from here; the server's own timings: {answer.get('timings')}", flush=True)
     seen = status(args, full=True)
     if seen.get("active") != variant:
         raise Failed(f"after the flip a full status reads {seen.get('active')!r}, not {variant!r}")
-    return {"variant": variant, "seconds": took, "timings": answer.get("timings"), "ranks": answer.get("ranks")}
+    return {"variant": variant, "seconds": took, "timings": answer.get("timings"), "ranks": answer.get("ranks"),
+            "derived": derived(seen)}
+
+
+def apart(x, y):
+    """Do two groups of numbers not overlap at all?"""
+    return bool(x) and bool(y) and (min(x) > max(y) or min(y) > max(x))
+
+
+def chance_apart(m, n):
+    """How often two groups of m and n draws from ONE source do not overlap at all, by chance."""
+    return 2 / math.comb(m + n, n)
 
 
 def judge(index, a1, b, a2):
-    """Walk the answers of one prompt to their first parting and say what it shows."""
+    """One prompt: where the answers first part, and what the margins there show."""
     runs = [("A before", r[index]) for r in a1] + [("B", r[index]) for r in b] + [("A after", r[index]) for r in a2]
     tokens = [[t["token"] for t in r["tokens"]] for _, r in runs]
     n = 0
     while all(len(t) > n for t in tokens) and len({t[n] for t in tokens}) == 1:
         n += 1
-    out = {"prompt": PROMPTS[index], "agree_for": n, "shared": "".join(tokens[0][:n])}
+    out = {"prompt": PROMPTS[index], "agree_for": n, "shared": "".join(tokens[0][:n]), "parts": False, "a_moved": False}
     if not all(len(t) > n for t in tokens):
         if len({len(t) for t in tokens}) == 1:
             return {**out, "verdict": "same", "note": "all answers are identical: this prompt does not tell the sets apart"}
         return {**out, "verdict": "unclear", "note": "some answers end where others go on"}
-    chosen = [t[n] for t in tokens]
-    passes = len(a1)
-    before, middle, after = set(chosen[:passes]), set(chosen[passes:2 * passes]), set(chosen[2 * passes:])
-    out["chosen"] = {"A before": chosen[:passes], "B": chosen[passes:2 * passes], "A after": chosen[2 * passes:]}
-    if len(before) == 1 and len(after) == 1 and len(middle) == 1:
-        if before == after and middle != before:
-            return {**out, "verdict": "clear", "note": "A chose one token every time, B another: repeatable, by set"}
-        if before != after:
-            return {**out, "verdict": "not restored", "note": "A after the return does not choose what A chose before"}
-    if before | after == middle or (before == middle and after == middle):
-        return {**out, "verdict": "noise", "note": "the same choices on both sides"}
-    return {**out, "verdict": "unclear", "note": "the parting does not sort by set"}
+    chosen = collections.Counter(t[n] for t in tokens).most_common()
+    first, second = chosen[0][0], chosen[1][0]
+    margins, picks = {side: [] for side in SIDES}, {side: [] for side in SIDES}
+    for side, r in runs:
+        top = dict((token, logprob) for token, logprob in r["tokens"][n]["top"])
+        top.setdefault(r["tokens"][n]["token"], r["tokens"][n]["logprob"])
+        floor = min(top.values())           # a token outside the list is at most this likely: margins can only shrink
+        margins[side].append(round(top.get(first, floor) - top.get(second, floor), 3))
+        picks[side].append(r["tokens"][n]["token"])
+    out.update(contenders=[first, second], margins={side: sorted(v) for side, v in margins.items()}, chosen=picks)
+    both_a = margins["A before"] + margins["A after"]
+    out["parts"] = apart(both_a, margins["B"])
+    out["a_moved"] = apart(margins["A before"], margins["A after"])
+    if out["a_moved"]:
+        return {**out, "verdict": "not restored", "note": "A after the return stands apart from A before"}
+    if out["parts"]:
+        return {**out, "verdict": "clear", "note": "every A margin on one side, every B margin on the other; A after sits with A before"}
+    if apart(margins["A before"], margins["B"]):
+        return {**out, "verdict": "unclear", "note": "A before stands apart from B, but A after the return does not"}
+    return {**out, "verdict": "noise", "note": "the margins of A and B overlap: this prompt does not tell the sets apart"}
 
 
 def main():
@@ -144,11 +188,14 @@ def main():
     parser.add_argument("--switch", help="base URL of the switch routes if not the same as the server")
     parser.add_argument("--api-key", help="API key of the server, if it has one")
     parser.add_argument("--token", help="X-Overlay-Token, if the switch asks for one")
-    parser.add_argument("--passes", type=int, default=2)
+    parser.add_argument("--passes", type=int, default=6, help=f"readings of each set (default 6, at least {MIN_PASSES})")
     parser.add_argument("--max-tokens", type=int, default=24)
-    parser.add_argument("--need", type=int, default=2, help="how many prompts must part clearly (default 2)")
+    parser.add_argument("--top", type=int, default=20, help="how many alternatives to ask for per token (default 20)")
+    parser.add_argument("--need", type=int, default=2, help="how many prompts must tell the sets apart (default 2)")
     parser.add_argument("--thinking-kwarg", default="enable_thinking",
                         help="chat template switch to turn thinking off; empty to send none")
+    parser.add_argument("--no-cache-salt", action="store_true",
+                        help="send no cache_salt (for a server that rejects the field); passes then share cached prefixes")
     parser.add_argument("--expect-parting", action="store_true",
                         help="the two sets are known to part on these prompts when served separately: "
                              "treat no parting at all as a failure, not as 'cannot tell'")
@@ -157,15 +204,18 @@ def main():
     args.server = args.server.rstrip("/")
     args.switch = (args.switch or args.server).rstrip("/")
     args.switch_headers = {"X-Overlay-Token": args.token} if args.token else {}
-    if args.passes < 2:
-        raise CouldNotRun("at least two passes: each set is judged against its own repeat")
+    args.nonce = secrets.token_hex(4)
+    if args.passes < MIN_PASSES:
+        raise CouldNotRun(f"at least {MIN_PASSES} passes: with fewer, two readings of one set stand apart by chance too often "
+                          f"(one time in {round(1 / chance_apart(3, 3))} at three passes)")
 
     code, models = call(args.server + "/v1/models", headers={"Authorization": f"Bearer {args.api_key}"} if args.api_key else {}, timeout=30)
     served = [m.get("id") for m in models.get("data", [])] if code == 200 else []
     if args.model not in served:
         raise CouldNotRun(f"{args.server} serves {served}, not {args.model!r}: nothing asked")
 
-    start = status(args)
+    start = status(args, full=True)        # on a fresh server this is what the startup derived, before anything was read
+    at_start = derived(start)
     a = start.get("active")
     if a not in OTHER:
         # not prepared yet: the first flip prepares. Flipping to "base" on a fresh server changes nothing.
@@ -177,36 +227,68 @@ def main():
     b = OTHER[a]
     print(f"A is {a!r} (live now), B is {b!r}")
 
-    a1 = reading(args, f"A ({a})")
+    a1 = reading(args, f"A ({a})", "a1")
     flips = [flip(args, b)]
-    rb = reading(args, f"B ({b})")
+    rb = reading(args, f"B ({b})", "b")
     flips.append(flip(args, a))
-    a2 = reading(args, f"A ({a}) again")
+    a2 = reading(args, f"A ({a}) again", "a2")
+    at_end = flips[-1]["derived"]
 
     verdicts = [judge(i, a1, rb, a2) for i in range(len(PROMPTS))]
     for v in verdicts:
         print(f"\n{v['prompt'][:70]!r}\n  all answers agree for {v['agree_for']} tokens: {v['shared'][:80]!r}")
-        for side, tokens in (v.get("chosen") or {}).items():
-            print(f"    {side:9} chose {tokens}")
+        if "margins" in v:
+            print(f"  margin of {v['contenders'][0]!r} over {v['contenders'][1]!r}:")
+            for side in SIDES:
+                picks = dict(collections.Counter(v["chosen"][side]))
+                print(f"    {side:9} {v['margins'][side]}  chose {picks}")
         print(f"  -> {v['verdict']}: {v['note']}")
     count = {k: sum(1 for v in verdicts if v["verdict"] == k) for k in ("clear", "not restored", "noise", "same", "unclear")}
-    print(f"\n{count}")
+    parts = sum(1 for v in verdicts if v["parts"])
+    moved = sum(1 for v in verdicts if v["a_moved"])
+    print(f"\n{count}; told apart on {parts} prompts")
+
+    exact = None
+    if at_start and at_end:
+        differing = sorted(r for r in set(at_start) | set(at_end) if at_start.get(r) != at_end.get(r))
+        same_as_b = sorted(r for r in at_start if flips[0]["derived"].get(r) == at_start[r])
+        exact = not differing
+        print(f"derived tensors, start against end: {'equal on every rank' if exact else 'DIFFERENT on rank ' + ', '.join(differing)} "
+              f"({len(at_start)} ranks)")
+        if same_as_b:
+            print(f"  note: on rank {', '.join(same_as_b)} the digest did not change with the flip to B")
+    else:
+        print("derived tensors: this switch does not report a digest; restoration is judged from the answers alone")
+
     if args.out:
         with open(args.out, "w") as f:
             json.dump({"server": args.server, "model": args.model, "A": a, "B": b, "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                       "passes": args.passes, "cache_salt": not args.no_cache_salt,
+                       "derived": {"start": at_start, "after flip to B": flips[0]["derived"], "end": at_end},
                        "flips": flips, "verdicts": verdicts, "readings": {"A before": a1, "B": rb, "A after": a2}}, f, indent=1)
         print("saved", args.out)
-    if count["not restored"]:
-        print("FAIL: after flipping back, the model does not choose what it chose before.")
+
+    by_chance = chance_apart(args.passes, args.passes)
+    if exact is False:
+        print("FAIL: after flipping back, the tensors derived from the weights are not what they were when the test began.")
         return 1
-    if count["clear"] >= args.need:
-        print(f"PASS: {count['clear']} prompts part clearly by set, and flipping back restores the first choices.")
+    if exact is None and moved:
+        print(f"FAIL: after flipping back, A stands apart from A before on {moved} prompt(s). On one set this happens by "
+              f"chance about one time in {round(1 / by_chance)} per prompt: run it again, and believe it if it repeats.")
+        return 1
+    if exact and moved:
+        print(f"note: A after the return stands apart from A before on {moved} prompt(s), while the weights and everything "
+              f"derived from them are byte for byte what they were. That is this deployment's own drift between readings "
+              f"(by chance alone: one time in {round(1 / by_chance)} per prompt).")
+    if parts >= args.need:
+        how = "the derived tensors are byte for byte what they were" if exact else "A after the return sits with A before"
+        print(f"PASS: {parts} prompts tell the two sets apart, and after flipping back {how}.")
         return 0
-    if count["clear"] == 0 and args.expect_parting:
-        print("FAIL: the status says the sets changed, but no answer parted by set. The model is not reading what was written.")
+    if parts == 0 and args.expect_parting:
+        print("FAIL: the status says the sets changed, but no prompt tells them apart. The model is not reading what was written.")
         return 1
-    print(f"CANNOT TELL: {count['clear']} prompts part clearly (wanted {args.need}). An overlay that leaves these "
-          "prompts alone looks the same; this is not proof that the flip did nothing.")
+    print(f"CANNOT TELL: {parts} prompts tell the sets apart (wanted {args.need}). An overlay that leaves these "
+          "prompts alone looks the same; this is not proof that the flip did nothing. More passes narrow it.")
     return 2
 
 

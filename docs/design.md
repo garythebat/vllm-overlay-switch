@@ -137,7 +137,10 @@ tensors.
 
 **Status** reads the first and last switched layer back. A write goes through the
 layers in order, so one that stopped halfway leaves those two disagreeing. `?full=1`
-reads every tensor.
+reads every tensor, and adds `derived`: one digest per rank of every tensor the model
+derived from the switched weights (the packed values, the two scale tables, the tiled
+copy where there is one). It can be read on a freshly started server, before anything
+was prepared. After a flip there and back it must be what it was, byte for byte.
 
 Which set is active is read from the weights, never remembered.
 
@@ -179,21 +182,36 @@ gone.
 ## Acceptance test
 
 `tools/acceptance.py`. It asks nothing sensitive and needs no reference answers. It
-uses the fact that two models with different weights choose different next tokens at
-some point where both have read exactly the same words, and that each model repeats its
-own choice.
+answers two questions separately.
 
-1. Ask a handful of plain prompts at temperature 0 with thinking off, twice, recording
-   the tokens.
-2. Flip. Ask again, twice. Flip back. Ask again, twice.
-3. For each prompt, walk the answers token by token while they all agree. At the first
-   point of disagreement, all answers on the first set must agree with each other, both
-   answers on the other set must agree with each other, and the two sets must differ.
-4. After flipping back, the choices must be the first set's again.
+**Does the model read what a flip wrote?** Two models with different weights weigh the
+next token differently at some point where both have read exactly the same words.
 
-Two identical requests to the same model do not return identical numbers on this kind
-of deployment, and wording can drift after a few tokens. That is why the test compares
-choices at identical contexts and each set against its own repeat, not raw numbers.
+1. Read the live set (A) several times: a handful of plain prompts at temperature 0 with
+   thinking off, recording the tokens and their alternatives. Flip, read the other set
+   (B). Flip back, read A again.
+2. For each prompt, walk the answers token by token while they all agree. At the first
+   place they part, every answer was produced from an identical context. The two tokens
+   most often chosen there are the contenders; an answer's margin is the log probability
+   of the first minus that of the second.
+3. A prompt tells the sets apart when every A margin, before and after, lies on one side
+   and every B margin on the other.
+
+**Does flipping back restore the model?** Exactly: the `derived` digest of every rank
+is read when the test begins and again when it ends, and must be equal. The weights
+themselves are read back by the switch after every flip. For a switch without the
+digest the answers have to do: A after the return must not stand apart from A before.
+
+**Why margins and several passes.** The first version of this test compared choices
+over two passes and assumed that a model repeats its own choice. On the first hardware
+it ran on, that was false: identical requests moved a margin by one to three logits
+(the logits there come out in steps of a quarter), enough to change the chosen token
+wherever two tokens were close. With two passes, two readings of one set stand apart by
+chance one time in three, and the test reported a failed return that was not one. Now
+each set is read six times by default, each request carries its own `cache_salt` so
+that no answer reuses another's cached prefix, and the judgement is on whether two
+groups of margins overlap at all. Two groups of six from one source do not overlap by
+chance one time in 462; twelve against six, one time in about nine thousand.
 
 ## Open questions, to be settled by running it
 
