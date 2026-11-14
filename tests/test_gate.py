@@ -479,8 +479,9 @@ class Effort(GateCase):
     def test_a_model_list_that_is_not_one_goes_out_as_it_came(self):
         async def scenario():
             self.make(effort=seven_steps())
-            for status, extra, body in ((500, [], b'{"error": "down"}'), (200, [], b"not json"), (200, [(b"content-encoding", b"gzip")], b'{"data": []}'),
-                                        (200, [], b'{"data": "x"}')):
+            # the third is a model list that would be rewritten, were it not said to be encoded
+            for status, extra, body in ((500, [], b'{"error": "down"}'), (200, [], b"not json"),
+                                        (200, [(b"content-encoding", b"gzip")], b'{"data": [{"id": "m"}]}'), (200, [], b'{"data": "x"}')):
                 headers = [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode()), *extra]
                 self.behind.models = (status, headers, [body])
                 got_status, got_headers, got_body = await call(self.mw, self.app_obj, "/v1/models", method="GET")
