@@ -60,13 +60,16 @@ class FakeEngine:
         self.calls.append(("resume",))
         self.paused = False
 
+    async def is_paused(self):
+        return self.paused
+
     async def reset_prefix_cache(self, *a, **k):
         self.calls.append(("reset_prefix_cache",))
         return True
 
 
-def run(engine, variant, mode="wait"):
-    return asyncio.run(logic.flip(engine, variant, mode))
+def run(engine, variant, mode="wait", force=False):
+    return asyncio.run(logic.flip(engine, variant, mode, force))
 
 
 class Flip(unittest.TestCase):
@@ -124,9 +127,43 @@ class Flip(unittest.TestCase):
         e = FakeEngine()
         e.active = ["base", "overlay", "base"]
         answer, status = run(e, "overlay")
-        self.assertEqual((status, answer["ok"]), (500, False))
+        self.assertEqual((status, answer["ok"]), (409, False))
         self.assertIn("disagree", answer["error"])
+        self.assertIn("force", answer["error"])
         self.assertEqual(e.calls, [("overlay_status",)])
+
+    def test_force_writes_one_set_over_ranks_that_disagree(self):
+        e = FakeEngine()
+        e.active = ["base", "overlay", "base"]
+        answer, status = run(e, "base", force=True)
+        self.assertEqual((status, answer["ok"], answer["changed"], answer["active"], answer["previous"]),
+                         (200, True, True, "base", None))
+        self.assertEqual(e.active, ["base", "base", "base"])
+        self.assertEqual(e.calls, [("overlay_status",), ("pause", "wait", True), ("overlay_switch", "base"),
+                                   ("reset_prefix_cache",), ("resume",)])
+
+    def test_force_rewrites_even_the_set_that_is_active_and_resumes(self):
+        # the way out after a flip that left generation paused
+        e = FakeEngine(active="base")
+        e.paused = True
+        answer, status = run(e, "base", force=True)
+        self.assertEqual((status, answer["ok"]), (200, True))
+        self.assertIn(("overlay_switch", "base"), e.calls)
+        self.assertFalse(e.paused)
+
+    def test_a_forced_flip_that_fails_has_nothing_to_put_back_and_stays_paused(self):
+        e = FakeEngine(fail={("overlay_switch", "base"): (1,)})
+        e.active = ["base", "overlay", "base"]
+        answer, status = run(e, "base", force=True)
+        self.assertEqual((status, answer["ok"], answer["paused"]), (500, False, True))
+        self.assertEqual([c for c in e.calls if c[0] == "overlay_switch"], [("overlay_switch", "base")])
+        self.assertNotIn(("resume",), e.calls)
+
+    def test_force_cannot_make_an_unprepared_rank_write(self):
+        e = FakeEngine(prepared=False, fail={("overlay_prepare", None): (1,)})
+        answer, status = run(e, "overlay", force=True)
+        self.assertEqual((status, answer["ok"]), (500, False))
+        self.assertNotIn(("overlay_switch", "overlay"), e.calls)
 
     def test_abort_mode_reaches_the_pause(self):
         e = FakeEngine()
