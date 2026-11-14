@@ -2,7 +2,7 @@
 
 Status: written from a reading of the engine source, tested off the hardware, and run on
 one setup on 14 November 2026 (see the table in the README). The gate (two endpoints on
-one server) is written and tested off the hardware only. Every reference below is to the pinned
+one server) ran on the same setup the same day. Every reference below is to the pinned
 commits listed in the README; `path:line` is in the vLLM fork unless it starts with
 `flashinfer/`.
 
@@ -288,6 +288,20 @@ back. Six flips in a row left the machines' free memory where it was. A full sta
 which reads every tensor back and fingerprints the derived ones, took about three
 seconds; that is why the fingerprint is not part of a flip.
 
+With the gate on the same setup: an answer took 0.69 s on average when its side was
+live and 2.22 s when the server had to flip first (36 answers, 2.02 to 2.66 s). Free
+memory, read five times a second on each machine during six flips, dipped at most
+0.07 GiB and came back. Requests of both sides arriving together take strict turns, a
+flip at every change of side: in two bursts of 12, half for each side, an answer took
+0.6 to 26.2 s and 11.2 s on average.
+
+A second launch gave the same server a 1,048,576-token window and a 3 GB KV cache per
+machine, which leaves each machine a few GiB free instead of six to eight. The
+acceptance test passed there too, with the same times (0.61 s and 2.24 s). The first
+two flips dipped free memory by 0.03 GiB, and over four minutes of flips and bursts the
+lowest reading on the tightest machine was 1.89 GiB; it had been 1.7 GiB after its first
+requests, before any flip. A flip does not need room of its own to speak of.
+
 ## Acceptance test
 
 `tools/acceptance.py`. It asks nothing sensitive and needs no reference answers. It
@@ -343,10 +357,30 @@ On the tested setup (14 November 2026):
   flipping there and back equalled the one the startup left, on two separate launches,
   and the startup's own digests were the same on both.
 - The image registered no plugins beyond vLLM's own two.
+- The gate holds on a real server. Its acceptance test passed: 156 answers each carried
+  the mark of the side asked for, and 60 answers asked in turn and in bursts, by
+  model name and under the prefix, all lay with their own side at a landmark.
+- The cache salt keeps the sides apart in the engine's own counters: a prompt asked
+  again on its side reused its prefix, the other side's first request for the same
+  prompt under the same client salt reused nothing, and after two flips the first side
+  still reused its own.
+- Sixty flips into a launch every tensor read back as base on every rank and the
+  derived digests were the startup's.
+- A client that left in the middle of a streamed answer did not hold the other side up:
+  twelve times out of twelve the next request for the other side was answered within
+  three seconds, on its own side.
+- The effort translation sits in front of the engine's own validation: values the
+  engine refuses with 400 were answered 200 at the top level and in
+  `chat_template_kwargs`, by either model name and under the prefix.
 
 Still open:
 
-- The gate on hardware: its acceptance test has not run against a real server.
+- A long generation on one side while the other is asked: the wait is by design, its
+  length was not measured.
+- A client that gives up while it waits in the line (it keeps its place).
+- Memory with a long cached conversation on each side at once: the tests' prompts are
+  short.
+- The API-key check under the prefix on a real server, and a server with `--root-path`.
 - Worker and queue state after a `collective_rpc` timeout.
 - A flip while requests are in flight, and under load from several clients.
 - Other tensor-parallel sizes, where the padding falls differently.
