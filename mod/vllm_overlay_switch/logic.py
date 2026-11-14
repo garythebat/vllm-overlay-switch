@@ -72,12 +72,16 @@ def same_files(results: list[Any]) -> tuple[bool, str]:
     return True, ""
 
 
-async def flip(engine, variant: str, mode: str, force: bool = False) -> tuple[dict, int]:
+async def flip(engine, variant: str, mode: str, force: bool = False, clear_cache: bool = True) -> tuple[dict, int]:
     """Pause, copy on every rank, verify, resume. Returns (answer, HTTP status).
 
     `force` is the way out of an unclear state (ranks that disagree, or weights that match
     neither set, as a flip that failed halfway leaves them): the chosen set is written onto
     every rank whatever is there now. There is then nothing to put back if it fails.
+
+    `clear_cache=False` leaves the prefix cache alone. That is only right when nothing computed
+    with one set can be reused with the other, as under the gate, which marks every request
+    with its side.
     """
     t0 = time.monotonic()
     timings: dict[str, float] = {}
@@ -110,7 +114,7 @@ async def flip(engine, variant: str, mode: str, force: bool = False) -> tuple[di
 
     t = time.monotonic()
     try:
-        await engine.pause_generation(mode=mode, clear_cache=True)
+        await engine.pause_generation(mode=mode, clear_cache=clear_cache)
     except Exception as e:
         # nothing was copied; make sure the engine is not left half paused
         try:
@@ -145,10 +149,12 @@ async def flip(engine, variant: str, mode: str, force: bool = False) -> tuple[di
                         "error": f"the flip failed ({why}) and so did putting the previous set back ({back_why}). "
                                  "Generation is left PAUSED: the ranks may hold different weights. "
                                  "Flip again with \"force\": true, or restart the server."}, 500
-            await engine.reset_prefix_cache()
+            if clear_cache:
+                await engine.reset_prefix_cache()
             return {"ok": False, "changed": False, "active": previous, "ranks": back, "timings": timings,
                     "error": f"the flip failed ({why}); {previous!r} was put back on every rank"}, 500
-        await engine.reset_prefix_cache()
+        if clear_cache:
+            await engine.reset_prefix_cache()
         timings["total_s"] = round(time.monotonic() - t0, 3)
         return {"ok": True, "changed": True, "active": variant, "previous": previous, "ranks": after, "timings": timings}, 200
     finally:

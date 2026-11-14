@@ -14,9 +14,17 @@ generation stays paused and the answer says so, because a model whose ranks hold
 weights must not answer anyone. `"force": true` is the way out of that state: it writes the
 chosen set onto every rank whatever is there, and resumes only if every rank then agrees.
 
-Who may call it: the local machine only, unless OVERLAY_SWITCH_ALLOW lists other client
+With OVERLAY_GATE_PREFIX set (see gate.py) the same server answers on two sets of paths, the
+base set on the usual ones and the overlay under the prefix, and flips by itself. The switch
+route then only takes a forced flip, the way out of a failed one: which side is live is no
+longer anyone's to choose by hand.
+
+Who may call these two routes: the local machine only, unless OVERLAY_SWITCH_ALLOW lists other client
 addresses. If OVERLAY_SWITCH_TOKEN is set, every call must also carry it in the
 X-Overlay-Token header. These routes are outside the paths the engine's own API key guards.
+
+The paths under the gate's prefix are outside them too, as the engine sees them. The gate is
+therefore handed the engine's own key check (`engine_key_check`) and applies it to them.
 """
 
 from __future__ import annotations
@@ -26,6 +34,7 @@ import asyncio
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from . import gate as gating
 from .logic import PAUSE_MODES, STATUS_TIMEOUT_S, VARIANTS, agree, flip, refusal, same_files
 
 
@@ -36,6 +45,11 @@ class OverlaySwitchEndpointPlugin:
     required_tasks = ("generate",)
 
     def attach_router(self, app: FastAPI) -> None:
+        prefix = gating.prefix_from_env()
+        if prefix:
+            # added here, before the engine adds its own middleware: the gate is then the innermost one
+            gating.install(app, prefix, engine_key_check(app))
+
         @app.get("/overlay/status")
         async def overlay_status(raw_request: Request):
             why = _refuse(raw_request)
@@ -54,8 +68,14 @@ class OverlaySwitchEndpointPlugin:
             same, why_not = agree(ranks)
             if same:
                 same, why_not = same_files(ranks)
-            return JSONResponse({"ok": same, "error": why_not or None, "paused": paused,
-                                 "active": ranks[0].get("active") if same else None, "ranks": ranks})
+            answer = {"ok": same, "error": why_not or None, "paused": paused,
+                      "active": ranks[0].get("active") if same else None, "ranks": ranks}
+            gated = getattr(raw_request.app.state, "overlay_gate_prefix", None)
+            if gated:
+                gate = getattr(raw_request.app.state, "overlay_gate", None)
+                answer["gate"] = {"prefix": gated, **(gate.describe() if gate else {"live": None, "in_flight": 0, "waiting": 0,
+                                                                                    "flips": 0, "waited_s": 0.0, "broken": None})}
+            return JSONResponse(answer)
 
         @app.post("/overlay/switch")
         async def overlay_switch(raw_request: Request):
@@ -78,6 +98,18 @@ class OverlaySwitchEndpointPlugin:
                 return JSONResponse({"ok": False, "error": f"mode must be one of {list(PAUSE_MODES)}"}, status_code=400)
             if not isinstance(force, bool):
                 return JSONResponse({"ok": False, "error": "force must be true or false"}, status_code=400)
+            if getattr(raw_request.app.state, "overlay_gate_prefix", None):
+                # gated: the path a request comes in on decides the side; by hand only the forced way out remains
+                if not force:
+                    return JSONResponse({"ok": False, "error": "this server is gated: requests on the usual paths get the base "
+                                                               "set, requests under the gate's prefix the overlay. Send "
+                                                               "\"force\": true to write one set onto every rank after a "
+                                                               "failed flip."}, status_code=409)
+                try:
+                    answer = await gating.gate_of(raw_request.app.state).force(variant)
+                except gating.GateError as e:
+                    return JSONResponse({"ok": False, "error": str(e)}, status_code=e.status)
+                return JSONResponse(answer)
             lock: asyncio.Lock = raw_request.app.state.overlay_switch_lock
             if lock.locked():
                 return JSONResponse({"ok": False, "error": "another flip is under way"}, status_code=409)
@@ -88,6 +120,26 @@ class OverlaySwitchEndpointPlugin:
     async def init_state(self, engine_client, state, args) -> None:
         state.overlay_switch_engine = engine_client
         state.overlay_switch_lock = asyncio.Lock()
+
+
+def engine_key_check(app):
+    """The engine's own API-key check, for the gate to run on what comes in under its prefix.
+
+    The engine guards paths by how they begin, so a path under the prefix would pass it without a
+    key. Returned is a function that wraps an ASGI app in the engine's own middleware, with the
+    keys the engine itself uses (--api-key, else VLLM_API_KEY); None on a server without a key.
+    If the server has a key and the engine's check cannot be found, this raises and the server
+    does not start: a gate that cannot check the key must not open a second set of paths.
+    """
+    from vllm import envs
+
+    args = getattr(app.state, "args", None)
+    tokens = [key for key in (getattr(args, "api_key", None) or [envs.VLLM_API_KEY]) if key]
+    if not tokens:
+        return None
+    from vllm.entrypoints.serve.middleware.authenticate import AuthenticationMiddleware
+
+    return lambda inner: AuthenticationMiddleware(inner, tokens=tokens)
 
 
 def _engine(raw_request: Request):

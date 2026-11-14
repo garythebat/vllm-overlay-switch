@@ -1,0 +1,413 @@
+"""The gate: one loaded model, two endpoints. Standard library only; no web framework, no engine.
+
+The stand-in engine is the one of test_logic (three ranks that hold "base" or "overlay"). The
+stand-in server behind the gate records, for every request it is handed, which set the engine
+held when the request started and when it ended, and holds the request open until the test
+lets it go. So the tests can say exactly who ran together with whom and on what.
+
+    python3 -m unittest tests.test_gate -v
+"""
+
+import asyncio
+import hashlib
+import json
+import os
+import sys
+import types
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(HERE, "..", "mod"))
+
+from test_logic import FakeEngine  # noqa: E402
+from vllm_overlay_switch import gate as gating  # noqa: E402
+
+CHAT, FREE_CHAT = "/v1/chat/completions", "/free/v1/chat/completions"
+
+
+class Behind:
+    """The server behind the gate: holds every request open until told, and writes down what it saw."""
+
+    def __init__(self, engine):
+        self.engine, self.seen, self.release, self.running = engine, [], {}, 0
+        self.most_at_once = 0
+
+    async def __call__(self, scope, receive, send):
+        message = await receive()
+        body = message.get("body", b"")
+        try:
+            request = json.loads(body)
+        except ValueError:
+            request = None
+        name = request.get("name") if isinstance(request, dict) else None
+        entry = {"name": name, "path": scope["path"], "method": scope["method"], "body": body, "request": request,
+                 "length": dict(scope["headers"]).get(b"content-length"), "held_at_start": list(self.engine.active)}
+        self.seen.append(entry)
+        self.running += 1
+        self.most_at_once = max(self.most_at_once, self.running)
+        await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"application/json")]})
+        if name in self.release:
+            await self.release[name].wait()                    # "generating": the stream is open
+        entry["held_at_end"] = list(self.engine.active)
+        self.running -= 1
+        await send({"type": "http.response.body", "body": b"{}"})
+
+    def hold(self, *names):
+        for name in names:
+            self.release[name] = asyncio.Event()
+
+
+async def call(mw, app_obj, path, body=None, method="POST", raw=None, key=None):
+    """One request through the middleware. Returns (status, headers, body)."""
+    payload = raw if raw is not None else json.dumps(body if body is not None else {}).encode()
+    scope = {"type": "http", "method": method, "path": path, "raw_path": path.encode(), "app": app_obj,
+             "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(payload)).encode())]}
+    if key:
+        scope["headers"].append((b"authorization", f"Bearer {key}".encode()))
+    sent, got = [], [{"type": "http.request", "body": payload, "more_body": False}]
+
+    async def receive():
+        if got:
+            return got.pop(0)
+        await asyncio.sleep(3600)
+
+    async def send(message):
+        sent.append(message)
+
+    await mw(scope, receive, send)
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    return start["status"], dict(start.get("headers", [])), b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
+
+
+async def settle():
+    for _ in range(20):
+        await asyncio.sleep(0)
+
+
+class EngineKey:
+    """Stands in for the engine's own API-key middleware, with its rule: a path that begins with
+    one of these needs the key, any other passes (vllm/entrypoints/serve/middleware/authenticate.py)."""
+
+    GUARDED = ("/v1", "/v2", "/inference", "/cohere")
+
+    def __init__(self, app, key):
+        self.app, self.key = app, key
+
+    def __call__(self, scope, receive, send):
+        given = dict(scope["headers"]).get(b"authorization", b"").decode()
+        if scope.get("method") != "OPTIONS" and scope["path"].startswith(self.GUARDED) and given != f"Bearer {self.key}":
+            return _unauthorized(send)
+        return self.app(scope, receive, send)
+
+
+async def _unauthorized(send):
+    await send({"type": "http.response.start", "status": 401, "headers": []})
+    await send({"type": "http.response.body", "body": b'{"error": "Unauthorized"}'})
+
+
+class SlowFlip(FakeEngine):
+    """An engine whose copy onto the ranks does not come back until the test says so."""
+
+    def __init__(self):
+        super().__init__()
+        self.go = asyncio.Event()
+
+    async def collective_rpc(self, method, timeout=None, args=(), kwargs=None):
+        if method == "overlay_switch":
+            self.calls.append(("copy begun", *args))
+            await self.go.wait()
+        return await super().collective_rpc(method, timeout, args, kwargs)
+
+
+class GateCase(unittest.TestCase):
+    def make(self, engine=None, key=None):
+        self.engine = engine or FakeEngine()
+        self.behind = Behind(self.engine)
+        self.app_obj = types.SimpleNamespace(state=types.SimpleNamespace(overlay_switch_engine=self.engine))
+        check = (lambda inner: EngineKey(inner, key)) if key else None
+        self.mw = gating.OverlayGateMiddleware(self.behind, prefix="/free", key_check=check)
+        return self.mw
+
+    def post(self, path, name, **extra):
+        return asyncio.ensure_future(call(self.mw, self.app_obj, path, {"name": name, **extra}))
+
+    @property
+    def gate(self):
+        return self.app_obj.state.overlay_gate
+
+    def flips_asked(self):
+        return [c[1] for c in self.engine.calls if c[0] == "overlay_switch"]
+
+
+class Order(GateCase):
+    def test_one_side_runs_together_the_other_waits_and_nobody_jumps_the_line(self):
+        async def scenario():
+            self.make()
+            self.behind.hold("b1", "b2", "f1", "b3")
+            b1, b2 = self.post(CHAT, "b1"), self.post(CHAT, "b2")
+            await settle()
+            self.assertEqual((self.gate.in_flight, self.behind.running), (2, 2))          # the live side runs together
+            f1 = self.post(FREE_CHAT, "f1")
+            await settle()
+            b3 = self.post(CHAT, "b3")                                                    # behind f1: it must wait its turn
+            await settle()
+            self.assertEqual([e["name"] for e in self.behind.seen], ["b1", "b2"])
+            self.assertEqual((self.gate.describe()["waiting"], self.flips_asked()), (2, []))
+            self.behind.release["b1"].set()
+            await settle()
+            self.assertEqual(self.flips_asked(), [])                                      # b2 is still in flight
+            self.behind.release["b2"].set()
+            await settle()
+            self.assertEqual(([e["name"] for e in self.behind.seen], self.flips_asked()), (["b1", "b2", "f1"], ["overlay"]))
+            self.assertEqual((self.gate.live, self.gate.in_flight), ("overlay", 1))
+            self.behind.release["f1"].set()
+            await settle()
+            self.assertEqual(([e["name"] for e in self.behind.seen], self.flips_asked()),
+                             (["b1", "b2", "f1", "b3"], ["overlay", "base"]))
+            self.behind.release["b3"].set()
+            results = await asyncio.gather(b1, b2, f1, b3)
+            self.assertEqual([r[0] for r in results], [200] * 4)
+            self.assertEqual([r[1][b"x-overlay-side"] for r in results], [b"base", b"base", b"overlay", b"base"])
+            # nobody ever ran on the other side's weights, from first token to last
+            for e in self.behind.seen:
+                want = "overlay" if e["name"].startswith("f") else "base"
+                self.assertEqual((e["held_at_start"], e["held_at_end"]), ([want] * 3, [want] * 3), e["name"])
+            self.assertEqual((self.gate.flips, self.gate.in_flight, self.gate.describe()["waiting"]), (2, 0, 0))
+        asyncio.run(scenario())
+
+    def test_many_at_once_from_both_sides_never_mix(self):
+        async def scenario():
+            self.make()
+            names = [f"{'f' if i % 3 == 0 else 'b'}{i}" for i in range(30)]
+            tasks = [self.post(FREE_CHAT if n.startswith("f") else CHAT, n) for n in names]
+            results = await asyncio.gather(*tasks)
+            self.assertEqual({r[0] for r in results}, {200})
+            self.assertEqual(len(self.behind.seen), 30)
+            for e in self.behind.seen:
+                want = "overlay" if e["name"].startswith("f") else "base"
+                self.assertEqual((e["held_at_start"], e["held_at_end"]), ([want] * 3, [want] * 3), e["name"])
+            self.assertEqual([e["name"] for e in self.behind.seen], names)               # served in the order they came
+        asyncio.run(scenario())
+
+    def test_the_first_request_prepares_and_a_base_request_writes_nothing(self):
+        async def scenario():
+            self.make(FakeEngine(prepared=False))
+            status, headers, _ = await call(self.mw, self.app_obj, CHAT, {"name": "b"})
+            self.assertEqual((status, headers[b"x-overlay-side"], self.gate.live, self.gate.flips), (200, b"base", "base", 0))
+            self.assertEqual(self.engine.calls, [("overlay_status",), ("overlay_prepare",)])
+        asyncio.run(scenario())
+
+    def test_a_gated_flip_clears_no_cache(self):
+        async def scenario():
+            self.make()
+            await call(self.mw, self.app_obj, FREE_CHAT, {"name": "f"})
+            self.assertIn(("pause", "wait", False), self.engine.calls)
+            self.assertNotIn(("reset_prefix_cache",), self.engine.calls)
+        asyncio.run(scenario())
+
+    def test_a_client_that_gives_up_while_waiting_does_not_hold_the_line(self):
+        async def scenario():
+            self.make()
+            self.behind.hold("b1")
+            b1 = self.post(CHAT, "b1")
+            await settle()
+            f1 = self.post(FREE_CHAT, "f1")
+            await settle()
+            b2 = self.post(CHAT, "b2")
+            await settle()
+            self.assertEqual(self.gate.describe()["waiting"], 2)
+            f1.cancel()
+            await settle()
+            self.assertEqual(self.gate.describe()["waiting"], 0)                          # b2 no longer has f1 before it
+            self.behind.release["b1"].set()
+            await asyncio.gather(b1, b2)
+            self.assertEqual((self.flips_asked(), [e["name"] for e in self.behind.seen]), ([], ["b1", "b2"]))
+        asyncio.run(scenario())
+
+
+class Failures(GateCase):
+    def test_a_failed_flip_answers_503_and_the_live_side_goes_on_serving(self):
+        async def scenario():
+            self.make(FakeEngine(fail={("overlay_switch", "overlay"): (2,)}))
+            self.assertEqual((await call(self.mw, self.app_obj, CHAT, {"name": "b1"}))[0], 200)
+            status, _, body = await call(self.mw, self.app_obj, FREE_CHAT, {"name": "f1"})
+            self.assertEqual(status, 503)
+            self.assertIn("was put back", json.loads(body)["error"]["message"])
+            self.assertEqual((self.gate.live, self.gate.broken, self.engine.active), ("base", None, ["base"] * 3))
+            self.assertEqual((await call(self.mw, self.app_obj, CHAT, {"name": "b2"}))[0], 200)
+            self.assertEqual([e["name"] for e in self.behind.seen], ["b1", "b2"])        # f1 never reached the model
+        asyncio.run(scenario())
+
+    def test_a_flip_that_leaves_the_engine_paused_shuts_the_gate_until_it_is_forced(self):
+        async def scenario():
+            self.make(FakeEngine(fail={("overlay_switch", "overlay"): (2,), ("overlay_switch", "base"): (0,)}))
+            await call(self.mw, self.app_obj, CHAT, {"name": "b1"})
+            self.assertEqual((await call(self.mw, self.app_obj, FREE_CHAT, {"name": "f1"}))[0], 503)
+            self.assertIn("PAUSED", self.gate.broken)
+            status, _, body = await call(self.mw, self.app_obj, CHAT, {"name": "b2"})
+            self.assertEqual(status, 503)                                                 # nobody runs on a split model
+            self.assertIn("PAUSED", json.loads(body)["error"]["message"])
+            self.engine.fail = {}
+            answer = await self.gate.force("base")
+            self.assertEqual((answer["ok"], self.gate.live, self.gate.broken, self.engine.paused), (True, "base", None, False))
+            self.assertEqual((await call(self.mw, self.app_obj, CHAT, {"name": "b3"}))[0], 200)
+            self.assertEqual([e["name"] for e in self.behind.seen], ["b1", "b3"])
+        asyncio.run(scenario())
+
+    def test_a_flip_cut_off_in_the_middle_shuts_the_gate_until_it_is_forced(self):
+        async def scenario():
+            self.make(SlowFlip())
+            self.engine.go.set()
+            await call(self.mw, self.app_obj, CHAT, {"name": "b1"})
+            self.engine.go.clear()
+            asked = self.post(FREE_CHAT, "f1")
+            await settle()
+            self.assertEqual(self.engine.calls[-1], ("copy begun", "overlay"))     # the copy is under way on the ranks
+            asked.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asked
+            self.assertEqual((self.gate.live, "interrupted" in self.gate.broken, self.gate.in_flight, len(self.gate._queue)),
+                             (None, True, 0, 0))
+            for path in (CHAT, FREE_CHAT):
+                status, _, body = await call(self.mw, self.app_obj, path, {"name": "x"})
+                self.assertEqual((status, "interrupted" in json.loads(body)["error"]["message"]), (503, True), path)
+            self.engine.go.set()
+            answer = await self.gate.force("base")
+            self.assertEqual((answer["ok"], self.gate.live, self.gate.broken, self.engine.paused), (True, "base", None, False))
+            self.assertEqual((await call(self.mw, self.app_obj, CHAT, {"name": "b2"}))[0], 200)
+            self.assertEqual([e["name"] for e in self.behind.seen], ["b1", "b2"])
+        asyncio.run(scenario())
+
+    def test_without_an_engine_the_gate_says_so(self):
+        async def scenario():
+            self.make()
+            del self.app_obj.state.overlay_switch_engine
+            status, _, body = await call(self.mw, self.app_obj, CHAT, {"name": "b"})
+            self.assertEqual((status, json.loads(body)["error"]["type"]), (503, "overlay_gate"))
+        asyncio.run(scenario())
+
+
+class Key(GateCase):
+    """The engine checks its key by how a path begins; under the prefix the gate has to run that check itself."""
+
+    def test_under_the_prefix_nothing_the_engine_guards_is_served_without_the_key(self):
+        async def scenario():
+            self.make(key="s3cret")
+            for path, method in ((FREE_CHAT, "POST"), ("/free/v1/completions", "POST"), ("/free/v1/models", "GET"),
+                                 ("/free/v1/embeddings", "POST"), ("/free/v2/rerank", "POST")):
+                for given in (None, "wrong"):
+                    status, _, body = await call(self.mw, self.app_obj, path, {"name": "f"}, method=method, key=given)
+                    self.assertEqual((status, body), (401, b'{"error": "Unauthorized"}'), (path, given))
+            self.assertEqual((self.behind.seen, self.engine.calls, hasattr(self.app_obj.state, "overlay_gate")), ([], [], False))
+            status, headers, _ = await call(self.mw, self.app_obj, FREE_CHAT, {"name": "f"}, key="s3cret")
+            self.assertEqual((status, headers[b"x-overlay-side"], self.behind.seen[-1]["held_at_start"]), (200, b"overlay", ["overlay"] * 3))
+            self.assertEqual((await call(self.mw, self.app_obj, "/free/v1/models", method="GET", key="s3cret"))[0], 200)
+        asyncio.run(scenario())
+
+    def test_what_the_engine_leaves_open_stays_open_under_the_prefix(self):
+        async def scenario():
+            self.make(key="s3cret")
+            for path, method in (("/free/health", "GET"), ("/free/metrics", "GET"), ("/free/tokenize", "POST")):
+                self.assertEqual((await call(self.mw, self.app_obj, path, {"name": "x"}, method=method))[0], 200, path)
+            self.assertEqual([e["path"] for e in self.behind.seen], ["/health", "/metrics", "/tokenize"])
+        asyncio.run(scenario())
+
+    def test_the_usual_paths_are_left_to_the_engines_own_check(self):
+        async def scenario():
+            self.make(key="s3cret")
+            # here nothing stands in front of the gate, so this passes: on a server the engine's own middleware does
+            self.assertEqual((await call(self.mw, self.app_obj, CHAT, {"name": "b"}))[0], 200)
+        asyncio.run(scenario())
+
+    def test_a_server_without_a_key_asks_for_none(self):
+        async def scenario():
+            self.make()
+            self.assertEqual((await call(self.mw, self.app_obj, FREE_CHAT, {"name": "f"}))[0], 200)
+        asyncio.run(scenario())
+
+
+class WhatPasses(GateCase):
+    def test_every_request_that_runs_the_model_is_marked_with_its_side(self):
+        async def scenario():
+            self.make()
+            status, headers, _ = await call(self.mw, self.app_obj, FREE_CHAT, {"name": "f", "cache_salt": "mine", "n": 1})
+            self.assertEqual((status, headers[b"x-overlay-side"]), (200, b"overlay"))
+            await call(self.mw, self.app_obj, CHAT, {"name": "b"})
+            f, b = self.behind.seen
+            mine = hashlib.sha256(b"mine").hexdigest()[:32]
+            self.assertEqual((f["path"], f["request"]["cache_salt"], f["request"]["n"]), (CHAT, f"overlay-gate:overlay:{mine}", 1))
+            self.assertEqual((b["path"], b["request"]["cache_salt"]), (CHAT, "overlay-gate:base"))
+            for e in (f, b):
+                self.assertEqual(int(e["length"]), len(e["body"]))
+        asyncio.run(scenario())
+
+    def test_what_is_refused_and_what_passes_untouched(self):
+        async def scenario():
+            self.make()
+            for raw in (b"not json", b"[1, 2]", b""):
+                status, _, body = await call(self.mw, self.app_obj, CHAT, raw=raw)
+                self.assertEqual((status, "JSON object" in json.loads(body)["error"]["message"]), (400, True), raw)
+            for path in ("/v1/embeddings", "/free/v1/embeddings", "/free/overlay/switch", "/collective_rpc", "/pause", "/free"):
+                status, _, body = await call(self.mw, self.app_obj, path, {"name": "x"})
+                self.assertEqual((status, "not served through the overlay gate" in json.loads(body)["error"]["message"]), (403, True), path)
+            self.assertEqual((self.behind.seen, self.engine.calls), ([], []))             # none of it reached anything
+            # what does not run the model passes, under the prefix with the prefix taken off, and asks the gate nothing
+            for path, method, inner in (("/v1/models", "GET", "/v1/models"), ("/free/v1/models", "GET", "/v1/models"),
+                                        ("/health", "GET", "/health"), ("/free/tokenize", "POST", "/tokenize"),
+                                        ("/overlay/switch", "POST", "/overlay/switch"), ("/overlay/status", "GET", "/overlay/status")):
+                status, headers, _ = await call(self.mw, self.app_obj, path, {"name": "x"}, method=method)
+                self.assertEqual((status, self.behind.seen[-1]["path"], b"x-overlay-side" in headers), (200, inner, False), path)
+            self.assertEqual((self.engine.calls, hasattr(self.app_obj.state, "overlay_gate")), ([], False))
+        asyncio.run(scenario())
+
+    def test_any_salt_the_engine_would_take_still_fits_with_the_side_in_front(self):
+        async def scenario():
+            self.make()
+            longest = "k" * 128                                  # the engine's own limit; with the side in front it must still pass
+            await call(self.mw, self.app_obj, FREE_CHAT, {"name": "f", "cache_salt": longest})
+            await call(self.mw, self.app_obj, FREE_CHAT, {"name": "g", "cache_salt": longest[:-1] + "j"})
+            await call(self.mw, self.app_obj, CHAT, {"name": "b", "cache_salt": longest})
+            salts = [e["request"]["cache_salt"] for e in self.behind.seen]
+            self.assertEqual(len(set(salts)), 3)                 # another salt or another side: another cache
+            for salt in salts:
+                self.assertTrue(len(salt) <= 128 and not set(salt) & set("@/\\\0"), salt)
+            for bad in ("", 5, ["x"], {"a": 1}, False):
+                status, _, body = await call(self.mw, self.app_obj, CHAT, {"name": "x", "cache_salt": bad})
+                self.assertEqual((status, "cache_salt" in json.loads(body)["error"]["message"]), (400, True), bad)
+            self.assertEqual(len(self.behind.seen), 3)
+        asyncio.run(scenario())
+
+    def test_a_request_that_would_run_after_its_answer_is_refused(self):
+        async def scenario():
+            self.make()
+            for path in ("/v1/responses", "/free/v1/responses"):
+                status, _, body = await call(self.mw, self.app_obj, path, {"name": "r", "background": True, "store": True})
+                self.assertEqual((status, "background" in json.loads(body)["error"]["message"]), (400, True), path)
+            self.assertEqual((self.behind.seen, self.engine.calls), ([], []))
+            self.assertEqual((await call(self.mw, self.app_obj, "/v1/responses", {"name": "r", "background": False}))[0], 200)
+        asyncio.run(scenario())
+
+    def test_a_websocket_is_closed(self):
+        async def scenario():
+            self.make()
+            sent = []
+
+            async def send(message):
+                sent.append(message)
+
+            await self.mw({"type": "websocket", "path": "/v1/realtime", "app": self.app_obj}, None, send)
+            self.assertEqual((sent, self.behind.seen), ([{"type": "websocket.close", "code": 1008}], []))
+        asyncio.run(scenario())
+
+    def test_a_prefix_that_would_swallow_the_real_paths_is_refused(self):
+        app = types.SimpleNamespace(state=types.SimpleNamespace(), add_middleware=lambda *a, **k: None)
+        for bad in ("/", "", "/v1", "v1/", "/overlay"):
+            with self.assertRaises(ValueError, msg=bad):
+                gating.install(app, bad)
+        gating.install(app, "free/")
+        self.assertEqual(app.state.overlay_gate_prefix, "/free")
+
+
+if __name__ == "__main__":
+    unittest.main()

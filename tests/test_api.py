@@ -7,8 +7,10 @@ machine. That makes the default refusal testable as it stands, and the allow-lis
 """
 
 import asyncio
+import hashlib
 import os
 import sys
+import types
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -23,7 +25,41 @@ except Exception:  # pragma: no cover
 
 from test_logic import FakeEngine  # noqa: E402
 
-ENV = ("OVERLAY_SWITCH_ALLOW", "OVERLAY_SWITCH_TOKEN")
+ENV = ("OVERLAY_SWITCH_ALLOW", "OVERLAY_SWITCH_TOKEN", "OVERLAY_GATE_PREFIX")
+AUTH_MODULE = "vllm.entrypoints.serve.middleware.authenticate"
+
+
+class EngineAuth:
+    """Stands in for the engine's API-key middleware: same arguments, same rule (a path that begins
+    with one of these needs the key; any other passes)."""
+
+    GUARDED = ("/v1", "/v2", "/inference", "/cohere")
+
+    def __init__(self, app, tokens):
+        self.app, self.tokens = app, tokens
+
+    def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope.get("method") == "OPTIONS":
+            return self.app(scope, receive, send)
+        given = dict(scope["headers"]).get(b"authorization", b"").decode()
+        if scope["path"].startswith(self.GUARDED) and given not in [f"Bearer {t}" for t in self.tokens]:
+            from fastapi.responses import JSONResponse
+
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)(scope, receive, send)
+        return self.app(scope, receive, send)
+
+
+def stand_in_engine(env_key=None, with_auth=True):
+    """The few engine modules the plugin reaches for, as sys.modules entries. Returns their names."""
+    names = ["vllm", "vllm.entrypoints", "vllm.entrypoints.serve", "vllm.entrypoints.serve.middleware"]
+    for name in names:
+        sys.modules[name] = types.ModuleType(name)
+    sys.modules["vllm"].envs = types.SimpleNamespace(VLLM_API_KEY=env_key)
+    if with_auth:
+        sys.modules[AUTH_MODULE] = types.ModuleType(AUTH_MODULE)
+        sys.modules[AUTH_MODULE].AuthenticationMiddleware = EngineAuth
+        names.append(AUTH_MODULE)
+    return names
 
 
 class BrokenEngine(FakeEngine):
@@ -39,18 +75,30 @@ class Routes(unittest.TestCase):
         self.api = api
         self.saved = {k: os.environ.pop(k, None) for k in ENV}
         os.environ["OVERLAY_SWITCH_ALLOW"] = "testclient"
+        self.engine_modules = stand_in_engine()
 
     def tearDown(self):
         for key, value in self.saved.items():
             os.environ.pop(key, None)
             if value is not None:
                 os.environ[key] = value
+        for name in set(self.engine_modules) | {AUTH_MODULE}:
+            sys.modules.pop(name, None)
 
-    def client(self, engine=None, attach_engine=True):
+    def client(self, engine=None, attach_engine=True, key=None):
         self.engine = engine or FakeEngine()
         self.app = FastAPI()
+        self.app.state.args = types.SimpleNamespace(api_key=[key] if key else None)      # as the engine sets it, before plugins
+
+        @self.app.post("/v1/chat/completions")           # stands in for the engine's own route
+        async def chat(body: dict):
+            return {"salt": body.get("cache_salt"), "held": list(self.engine.active)}
+
         plugin = self.api.OverlaySwitchEndpointPlugin()
         plugin.attach_router(self.app)
+        tokens = [k for k in ([key] if key else [sys.modules["vllm"].envs.VLLM_API_KEY]) if k]
+        if tokens:
+            self.app.add_middleware(EngineAuth, tokens=tokens)                         # the engine adds its own afterwards: outside
         if attach_engine:
             asyncio.run(plugin.init_state(self.engine, self.app.state, None))
         return TestClient(self.app)
@@ -137,6 +185,83 @@ class Routes(unittest.TestCase):
         self.assertIn("overlay_status", answer.json()["error"])
         answer = client.post("/overlay/switch", json={"variant": "overlay"})
         self.assertEqual((answer.status_code, answer.json()["ok"]), (500, False))
+
+    # ---- the gate, as the plugin installs it
+
+    def test_without_the_prefix_there_is_no_gate(self):
+        c = self.client()
+        self.assertNotIn("gate", c.get("/overlay/status").json())
+        self.assertEqual(c.post("/free/v1/chat/completions", json={}).status_code, 404)
+        answer = c.post("/v1/chat/completions", json={})
+        self.assertEqual((answer.json()["salt"], "x-overlay-side" in answer.headers), (None, False))
+
+    def test_with_the_prefix_one_server_answers_on_two_sets_of_paths(self):
+        os.environ["OVERLAY_GATE_PREFIX"] = "/free"
+        c = self.client()
+        gate = c.get("/overlay/status").json()["gate"]
+        self.assertEqual((gate["prefix"], gate["live"], gate["flips"]), ("/free", None, 0))
+        free = c.post("/free/v1/chat/completions", json={"messages": []})
+        self.assertEqual((free.status_code, free.headers["x-overlay-side"]), (200, "overlay"))
+        self.assertEqual(free.json(), {"salt": "overlay-gate:overlay", "held": ["overlay"] * 3})
+        usual = c.post("/v1/chat/completions", json={"messages": [], "cache_salt": "k"})
+        salt = "overlay-gate:base:" + hashlib.sha256(b"k").hexdigest()[:32]
+        self.assertEqual((usual.headers["x-overlay-side"], usual.json()), ("base", {"salt": salt, "held": ["base"] * 3}))
+        gate = c.get("/overlay/status").json()["gate"]
+        self.assertEqual((gate["live"], gate["flips"], gate["in_flight"], gate["waiting"]), ("base", 2, 0, 0))
+        self.assertIn(("pause", "wait", False), self.engine.calls)
+        self.assertNotIn(("reset_prefix_cache",), self.engine.calls)
+        self.assertEqual(c.get("/free/overlay/status").status_code, 200)                 # a GET passes with the prefix taken off
+        self.assertEqual(c.post("/free/v1/embeddings", json={}).status_code, 403)
+
+    def test_under_the_gate_only_a_forced_flip_is_taken_by_hand(self):
+        os.environ["OVERLAY_GATE_PREFIX"] = "/free"
+        c = self.client()
+        refused = c.post("/overlay/switch", json={"variant": "overlay"})
+        self.assertEqual(refused.status_code, 409)
+        self.assertIn("gated", refused.json()["error"])
+        self.assertEqual(self.engine.calls, [])
+        forced = c.post("/overlay/switch", json={"variant": "overlay", "force": True})
+        self.assertEqual((forced.status_code, forced.json()["active"], self.engine.active), (200, "overlay", ["overlay"] * 3))
+        self.assertEqual(c.get("/overlay/status").json()["gate"]["live"], "overlay")
+        # and the gate goes on from there: the next request on the usual path flips back by itself
+        self.assertEqual(c.post("/v1/chat/completions", json={}).json()["held"], ["base"] * 3)
+
+    # ---- the server's API key, which the engine checks by how a path begins
+
+    def both_ways_in(self, c, key=None):
+        headers = {"Authorization": f"Bearer {key}"} if key else {}
+        return [c.post(path, json={"messages": []}, headers=headers) for path in ("/v1/chat/completions", "/free/v1/chat/completions")]
+
+    def test_with_a_key_the_paths_under_the_prefix_ask_for_it_too(self):
+        os.environ["OVERLAY_GATE_PREFIX"] = "/free"
+        c = self.client(key="s3cret")
+        for given in (None, "wrong"):
+            self.assertEqual([a.status_code for a in self.both_ways_in(c, given)], [401, 401], given)
+        self.assertEqual(c.get("/free/v1/models").status_code, 401)
+        self.assertEqual(self.engine.calls, [])                                        # nothing was flipped for a stranger
+        usual, free = self.both_ways_in(c, "s3cret")
+        self.assertEqual((usual.status_code, usual.json()["held"], free.status_code, free.json()["held"]),
+                         (200, ["base"] * 3, 200, ["overlay"] * 3))
+
+    def test_the_key_from_the_environment_counts_as_the_engine_counts_it(self):
+        os.environ["OVERLAY_GATE_PREFIX"] = "/free"
+        sys.modules["vllm"].envs.VLLM_API_KEY = "from-env"
+        c = self.client()
+        self.assertEqual([a.status_code for a in self.both_ways_in(c)], [401, 401])
+        self.assertEqual([a.status_code for a in self.both_ways_in(c, "from-env")], [200, 200])
+
+    def test_a_key_whose_check_cannot_be_found_stops_the_server(self):
+        os.environ["OVERLAY_GATE_PREFIX"] = "/free"
+        del sys.modules[AUTH_MODULE]
+        with self.assertRaises(ImportError):
+            self.client(key="s3cret")
+        self.client()                                                                  # without a key there is nothing to find
+
+    def test_without_the_prefix_the_key_is_the_engines_business_alone(self):
+        del sys.modules[AUTH_MODULE]
+        c = self.client(key="s3cret")
+        self.assertEqual(c.post("/v1/chat/completions", json={}).status_code, 401)
+        self.assertEqual(c.post("/v1/chat/completions", json={}, headers={"Authorization": "Bearer s3cret"}).status_code, 200)
 
 
 if __name__ == "__main__":

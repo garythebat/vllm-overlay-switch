@@ -31,6 +31,21 @@ need vllm/models/deepseek_v4_1/attention.py "def setup_wo_projection"
 need vllm/models/deepseek_v4_1/attention.py "_wo_projection_weights"
 need vllm/models/deepseek_v4_1/nvidia/b12x_attention.py "class DeepseekV41B12xAttention"
 need vllm/model_executor/parameter.py "def copy_tensor_parallel_shard"
+# What the gate (two endpoints on one server, OVERLAY_GATE_PREFIX) stands on as well: a pause that can leave
+# the cache alone, a cache salt that is part of what a cached block is known by, and the engine's API-key check.
+need vllm/v1/engine/async_llm.py "clear_cache: bool"
+need vllm/entrypoints/generate/base/protocol.py "def validate_cache_salt"
+need vllm/v1/core/kv_cache_utils.py "request.cache_salt"
+need vllm/entrypoints/serve/middleware/authenticate.py "class AuthenticationMiddleware"
+need vllm/entrypoints/launchers/app.py "app.state.args = args"
+need vllm/envs.py "VLLM_API_KEY"
+# The gate must sit inside the engine's own middleware: endpoint plugins have to be attached before it is added.
+python3 - "$PYTHON_ROOT/vllm/entrypoints/launchers/app.py" <<'PY' || die "not the engine this was written for: endpoint plugins are not attached before the engine's middleware"
+import sys
+text = open(sys.argv[1]).read()
+plugins, middleware = text.find("attach_endpoint_plugins(app"), text.find("init_entrypoints_middleware(args, app")
+sys.exit(0 if 0 <= plugins < middleware else 1)
+PY
 # The kernel library is imported as `b12x`, a thin alias package whose code lives inside
 # flashinfer. Look in both places, without importing either.
 python3 - <<'PY' || die "the b12x kernel library does not offer wo_projection.pack_weights"
@@ -81,5 +96,8 @@ say "the launch needs: --worker-extension-cls vllm_overlay_switch.worker.Overlay
 say "the launch needs: OVERLAY_SWITCH_FILE=<the side file, as the container sees it>"
 say "the launch needs: VLLM_PLUGINS=$OTHERS"
 say "  (VLLM_PLUGINS is an allow-list for every vLLM plugin; the value above keeps what this image already loads)"
-if [ -z "${OVERLAY_SWITCH_FILE:-}" ]; then say "note: OVERLAY_SWITCH_FILE is not set in this container yet"; fi
-case ",${VLLM_PLUGINS:-}," in *,overlay_switch,*) ;; *) say "note: VLLM_PLUGINS does not name overlay_switch yet: the routes will not load";; esac
+say "for two endpoints on this one server, the launch also sets: OVERLAY_GATE_PREFIX=/free"
+say "  (the base set then answers on the usual paths and the overlay under /free, e.g. /free/v1/chat/completions)"
+# The launch usually sets these after this script has run, so their absence here says nothing about the launch.
+if [ -z "${OVERLAY_SWITCH_FILE:-}" ]; then say "(OVERLAY_SWITCH_FILE is not set in this shell; that is as it should be when the launch sets it)"; fi
+case ",${VLLM_PLUGINS:-}," in *,overlay_switch,*) ;; *) say "(VLLM_PLUGINS does not name overlay_switch in this shell; the launch has to, or the routes will not load)";; esac
