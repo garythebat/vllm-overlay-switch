@@ -30,7 +30,7 @@ class Behind:
     """The server behind the gate: holds every request open until told, and writes down what it saw."""
 
     def __init__(self, engine):
-        self.engine, self.seen, self.release, self.running = engine, [], {}, 0
+        self.engine, self.seen, self.release, self.running, self.headers = engine, [], {}, 0, []
         self.most_at_once = 0
 
     async def __call__(self, scope, receive, send):
@@ -41,6 +41,7 @@ class Behind:
         except ValueError:
             request = None
         name = request.get("name") if isinstance(request, dict) else None
+        self.headers.append(scope["headers"])
         entry = {"name": name, "path": scope["path"], "method": scope["method"], "body": body, "request": request,
                  "length": dict(scope["headers"]).get(b"content-length"), "held_at_start": list(self.engine.active)}
         self.seen.append(entry)
@@ -121,12 +122,12 @@ class SlowFlip(FakeEngine):
 
 
 class GateCase(unittest.TestCase):
-    def make(self, engine=None, key=None):
+    def make(self, engine=None, key=None, models=()):
         self.engine = engine or FakeEngine()
         self.behind = Behind(self.engine)
         self.app_obj = types.SimpleNamespace(state=types.SimpleNamespace(overlay_switch_engine=self.engine))
         check = (lambda inner: EngineKey(inner, key)) if key else None
-        self.mw = gating.OverlayGateMiddleware(self.behind, prefix="/free", key_check=check)
+        self.mw = gating.OverlayGateMiddleware(self.behind, prefix="/free", key_check=check, overlay_models=models)
         return self.mw
 
     def post(self, path, name, **extra):
@@ -204,6 +205,25 @@ class Order(GateCase):
             await call(self.mw, self.app_obj, FREE_CHAT, {"name": "f"})
             self.assertIn(("pause", "wait", False), self.engine.calls)
             self.assertNotIn(("reset_prefix_cache",), self.engine.calls)
+        asyncio.run(scenario())
+
+    def test_a_request_cut_off_while_it_runs_is_counted_out_at_once_and_the_other_side_gets_its_turn(self):
+        async def scenario():
+            self.make()
+            self.behind.hold("b1")
+            running = self.post(CHAT, "b1")
+            await settle()
+            waiting = self.post(FREE_CHAT, "f1")
+            await settle()
+            self.assertEqual((self.gate.in_flight, len(self.gate._queue), self.flips_asked()), (1, 1, []))
+            running.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await running
+            self.assertEqual(self.gate.in_flight, 0)             # counted out without waiting for anything
+            status, headers, _ = await waiting
+            self.assertEqual((status, headers[b"x-overlay-side"], self.behind.seen[-1]["held_at_start"]), (200, b"overlay", ["overlay"] * 3))
+            await settle()                                       # the last wake-up has run by now and is forgotten
+            self.assertEqual((self.gate.in_flight, len(self.gate._queue), len(self.gate._wakes)), (0, 0, 0))
         asyncio.run(scenario())
 
     def test_a_client_that_gives_up_while_waiting_does_not_hold_the_line(self):
@@ -327,6 +347,65 @@ class Key(GateCase):
         asyncio.run(scenario())
 
 
+class ByName(GateCase):
+    """A client that picks from the model list: a name on the list of overlay names chooses the overlay."""
+
+    def test_the_model_a_request_names_chooses_its_side_on_the_usual_paths(self):
+        async def scenario():
+            self.make(models=("m-free", "m-also-free"))
+            for path in gating.MODEL_PATHS:
+                for model, side in (("m", "base"), ("m-free", "overlay"), ("m-also-free", "overlay"), (None, "base")):
+                    body = {"name": f"{path} {model}"} if model is None else {"name": f"{path} {model}", "model": model}
+                    status, headers, _ = await call(self.mw, self.app_obj, path, body)
+                    seen = self.behind.seen[-1]
+                    self.assertEqual((status, headers[b"x-overlay-side"].decode(), seen["held_at_start"], seen["request"]["cache_salt"],
+                                      seen["request"].get("model")), (200, side, [side] * 3, f"overlay-gate:{side}", model), (path, model))
+        asyncio.run(scenario())
+
+    def test_under_the_prefix_every_request_is_for_the_overlay_whatever_it_names(self):
+        async def scenario():
+            self.make(models=("m-free",))
+            for model in ("m", "m-free", "nobody"):
+                status, headers, _ = await call(self.mw, self.app_obj, FREE_CHAT, {"name": model, "model": model})
+                self.assertEqual((status, headers[b"x-overlay-side"], self.behind.seen[-1]["held_at_start"]), (200, b"overlay", ["overlay"] * 3), model)
+            self.assertEqual(self.flips_asked(), ["overlay"])
+        asyncio.run(scenario())
+
+    def test_a_model_that_is_no_name_at_all_is_left_to_the_engine_on_the_base_side(self):
+        async def scenario():
+            self.make(models=("m-free",))
+            for model in (["m-free"], {"m-free": 1}, 7, True, "M-FREE", " m-free"):
+                status, headers, _ = await call(self.mw, self.app_obj, CHAT, {"name": "x", "model": model})
+                self.assertEqual((status, headers[b"x-overlay-side"], self.behind.seen[-1]["request"]["model"]), (200, b"base", model), model)
+            self.assertEqual(self.flips_asked(), [])
+        asyncio.run(scenario())
+
+    def test_without_names_the_model_chooses_nothing(self):
+        async def scenario():
+            self.make()
+            status, headers, _ = await call(self.mw, self.app_obj, CHAT, {"name": "x", "model": "m-free"})
+            self.assertEqual((status, headers[b"x-overlay-side"]), (200, b"base"))
+        asyncio.run(scenario())
+
+    def test_the_names_are_read_from_the_environment_and_kept_for_the_status(self):
+        saved = os.environ.get(gating.MODELS_ENV)
+        try:
+            os.environ[gating.MODELS_ENV] = " m-free, ,m-also-free,m-free "
+            self.assertEqual(gating.models_from_env(), ("m-free", "m-also-free", "m-free"))
+            added = []
+            app = types.SimpleNamespace(state=types.SimpleNamespace(), add_middleware=lambda *a, **k: added.append(k))
+            gating.install(app, "/free", None, gating.models_from_env())
+            self.assertEqual((app.state.overlay_gate_models, added[0]["overlay_models"]), (("m-free", "m-also-free"),) * 2)
+            os.environ.pop(gating.MODELS_ENV)
+            self.assertEqual(gating.models_from_env(), ())
+            with self.assertRaises(ValueError):
+                gating.install(app, "/free", None, ("ok", 5))
+        finally:
+            os.environ.pop(gating.MODELS_ENV, None)
+            if saved is not None:
+                os.environ[gating.MODELS_ENV] = saved
+
+
 class WhatPasses(GateCase):
     def test_every_request_that_runs_the_model_is_marked_with_its_side(self):
         async def scenario():
@@ -355,6 +434,8 @@ class WhatPasses(GateCase):
             # what does not run the model passes, under the prefix with the prefix taken off, and asks the gate nothing
             for path, method, inner in (("/v1/models", "GET", "/v1/models"), ("/free/v1/models", "GET", "/v1/models"),
                                         ("/health", "GET", "/health"), ("/free/tokenize", "POST", "/tokenize"),
+                                        ("/v1/messages/count_tokens", "POST", "/v1/messages/count_tokens"),
+                                        ("/free/v1/messages/count_tokens", "POST", "/v1/messages/count_tokens"),
                                         ("/overlay/switch", "POST", "/overlay/switch"), ("/overlay/status", "GET", "/overlay/status")):
                 status, headers, _ = await call(self.mw, self.app_obj, path, {"name": "x"}, method=method)
                 self.assertEqual((status, self.behind.seen[-1]["path"], b"x-overlay-side" in headers), (200, inner, False), path)
@@ -386,6 +467,29 @@ class WhatPasses(GateCase):
                 self.assertEqual((status, "background" in json.loads(body)["error"]["message"]), (400, True), path)
             self.assertEqual((self.behind.seen, self.engine.calls), ([], []))
             self.assertEqual((await call(self.mw, self.app_obj, "/v1/responses", {"name": "r", "background": False}))[0], 200)
+        asyncio.run(scenario())
+
+    def test_a_body_sent_in_pieces_arrives_whole_with_its_length(self):
+        async def scenario():
+            self.make()
+            pieces = [b'{"name": "c", ', b'"messages": []}']
+            scope = {"type": "http", "method": "POST", "path": FREE_CHAT, "raw_path": FREE_CHAT.encode(), "app": self.app_obj,
+                     "headers": [(b"content-type", b"application/json"), (b"transfer-encoding", b"chunked")]}
+            coming = [{"type": "http.request", "body": pieces[0], "more_body": True},
+                      {"type": "http.request", "body": pieces[1], "more_body": False}]
+            sent = []
+
+            async def receive():
+                return coming.pop(0) if coming else await asyncio.sleep(3600)
+
+            async def send(message):
+                sent.append(message)
+
+            await self.mw(scope, receive, send)
+            entry = self.behind.seen[0]
+            self.assertEqual((entry["request"]["name"], entry["request"]["cache_salt"], int(entry["length"])),
+                             ("c", "overlay-gate:overlay", len(entry["body"])))
+            self.assertNotIn(b"transfer-encoding", dict(self.behind.headers[0]))
         asyncio.run(scenario())
 
     def test_a_websocket_is_closed(self):

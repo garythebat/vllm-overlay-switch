@@ -25,7 +25,7 @@ except Exception:  # pragma: no cover
 
 from test_logic import FakeEngine  # noqa: E402
 
-ENV = ("OVERLAY_SWITCH_ALLOW", "OVERLAY_SWITCH_TOKEN", "OVERLAY_GATE_PREFIX")
+ENV = ("OVERLAY_SWITCH_ALLOW", "OVERLAY_SWITCH_TOKEN", "OVERLAY_GATE_PREFIX", "OVERLAY_GATE_MODELS")
 AUTH_MODULE = "vllm.entrypoints.serve.middleware.authenticate"
 
 
@@ -85,10 +85,11 @@ class Routes(unittest.TestCase):
         for name in set(self.engine_modules) | {AUTH_MODULE}:
             sys.modules.pop(name, None)
 
-    def client(self, engine=None, attach_engine=True, key=None):
+    def client(self, engine=None, attach_engine=True, key=None, servers=1):
         self.engine = engine or FakeEngine()
         self.app = FastAPI()
-        self.app.state.args = types.SimpleNamespace(api_key=[key] if key else None)      # as the engine sets it, before plugins
+        # as the engine sets it, before plugins
+        self.app.state.args = types.SimpleNamespace(api_key=[key] if key else None, api_server_count=servers)
 
         @self.app.post("/v1/chat/completions")           # stands in for the engine's own route
         async def chat(body: dict):
@@ -199,7 +200,7 @@ class Routes(unittest.TestCase):
         os.environ["OVERLAY_GATE_PREFIX"] = "/free"
         c = self.client()
         gate = c.get("/overlay/status").json()["gate"]
-        self.assertEqual((gate["prefix"], gate["live"], gate["flips"]), ("/free", None, 0))
+        self.assertEqual((gate["prefix"], gate["models"], gate["live"], gate["flips"]), ("/free", [], None, 0))
         free = c.post("/free/v1/chat/completions", json={"messages": []})
         self.assertEqual((free.status_code, free.headers["x-overlay-side"]), (200, "overlay"))
         self.assertEqual(free.json(), {"salt": "overlay-gate:overlay", "held": ["overlay"] * 3})
@@ -212,6 +213,17 @@ class Routes(unittest.TestCase):
         self.assertNotIn(("reset_prefix_cache",), self.engine.calls)
         self.assertEqual(c.get("/free/overlay/status").status_code, 200)                 # a GET passes with the prefix taken off
         self.assertEqual(c.post("/free/v1/embeddings", json={}).status_code, 403)
+
+    def test_with_names_a_model_on_the_list_chooses_the_overlay_on_the_usual_path(self):
+        os.environ["OVERLAY_GATE_PREFIX"] = "/free"
+        os.environ["OVERLAY_GATE_MODELS"] = "m-free"
+        c = self.client()
+        self.assertEqual(c.get("/overlay/status").json()["gate"]["models"], ["m-free"])
+        free = c.post("/v1/chat/completions", json={"model": "m-free", "messages": []})
+        self.assertEqual((free.headers["x-overlay-side"], free.json()), ("overlay", {"salt": "overlay-gate:overlay", "held": ["overlay"] * 3}))
+        usual = c.post("/v1/chat/completions", json={"model": "m", "messages": []})
+        self.assertEqual((usual.headers["x-overlay-side"], usual.json()["held"]), ("base", ["base"] * 3))
+        self.assertEqual(c.get("/overlay/status").json()["gate"]["flips"], 2)
 
     def test_under_the_gate_only_a_forced_flip_is_taken_by_hand(self):
         os.environ["OVERLAY_GATE_PREFIX"] = "/free"
@@ -256,6 +268,14 @@ class Routes(unittest.TestCase):
         with self.assertRaises(ImportError):
             self.client(key="s3cret")
         self.client()                                                                  # without a key there is nothing to find
+
+    def test_the_gate_refuses_a_server_of_several_processes(self):
+        self.client(servers=4)                                                         # without the gate: nobody's business
+        os.environ["OVERLAY_GATE_PREFIX"] = "/free"
+        with self.assertRaises(RuntimeError) as refused:
+            self.client(servers=4)
+        self.assertIn("one API server process, not 4", str(refused.exception))
+        self.client(servers=None)                                                      # not said: one
 
     def test_without_the_prefix_the_key_is_the_engines_business_alone(self):
         del sys.modules[AUTH_MODULE]

@@ -5,6 +5,11 @@ the same paths under `/free` with the overlay: `/v1/chat/completions` and
 `/free/v1/chat/completions`. The gate sits in front of every request and flips the weights
 when a request arrives for the side that is not live.
 
+A request can also choose the overlay by the model it names. `OVERLAY_GATE_MODELS` lists model
+names that mean the overlay on the usual paths; serve them as further names of the one model
+(`--served-model-name BASE_NAME OVERLAY_NAME`) and a client that picks from the model list
+finds both under one address. Under the prefix every request is for the overlay, whatever it names.
+
 The two sides never run in the same instant: the kernel takes one set of weights for everything
 it decodes together. So:
 
@@ -50,8 +55,9 @@ import time
 from .logic import VARIANTS, flip
 
 PREFIX_ENV = "OVERLAY_GATE_PREFIX"
+MODELS_ENV = "OVERLAY_GATE_MODELS"
 MODEL_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/responses", "/v1/messages")
-PASS_PATHS = ("/tokenize", "/detokenize")
+PASS_PATHS = ("/tokenize", "/detokenize", "/v1/messages/count_tokens")       # they render and count; none runs the model
 SWITCH_PATHS = ("/overlay/switch",)
 HEADER = b"x-overlay-side"
 MAX_BODY = 64 << 20
@@ -84,6 +90,7 @@ class Gate:
         self.waited_s = 0.0
         self._queue: collections.deque[_Ticket] = collections.deque()
         self._cond = asyncio.Condition()
+        self._wakes: set[asyncio.Future] = set()
 
     def describe(self) -> dict:
         return {"live": self.live, "in_flight": self.in_flight, "waiting": len(self._queue), "flips": self.flips,
@@ -115,9 +122,16 @@ class Gate:
                 self.waited_s += time.monotonic() - t0
                 self._cond.notify_all()
 
-    async def leave(self) -> None:
+    def leave(self) -> None:
+        """The request has ended. Not a coroutine, on purpose: a request that is being cancelled must still be
+        counted out, and the count must not hang on an await that a second cancellation could cut."""
+        self.in_flight -= 1
+        wake = asyncio.ensure_future(self._wake())          # those waiting look again; a task of its own, so it outlives us
+        self._wakes.add(wake)
+        wake.add_done_callback(self._wakes.discard)
+
+    async def _wake(self) -> None:
         async with self._cond:
-            self.in_flight -= 1
             self._cond.notify_all()
 
     async def _change_to(self, side: str, force: bool = False) -> dict:
@@ -172,16 +186,20 @@ def gate_of(state) -> Gate:
     return gate
 
 
-def install(app, prefix: str, key_check=None) -> None:
+def install(app, prefix: str, key_check=None, overlay_models=()) -> None:
     """Called by the endpoint plugin while the app is built, before the engine adds its own middleware:
     the gate is then the innermost one and sees only requests that passed the engine's own checks.
 
-    `key_check` wraps an ASGI app in the engine's API-key check, or is None on a server without a key."""
+    `key_check` wraps an ASGI app in the engine's API-key check, or is None on a server without a key.
+    `overlay_models` are model names that choose the overlay on the usual paths."""
     prefix = "/" + prefix.strip("/")
     if prefix == "/" or any(p == prefix or p.startswith(prefix + "/") for p in MODEL_PATHS + PASS_PATHS + SWITCH_PATHS):
         raise ValueError(f"{PREFIX_ENV}={prefix!r} is not a usable path prefix")
-    app.state.overlay_gate_prefix = prefix
-    app.add_middleware(OverlayGateMiddleware, prefix=prefix, key_check=key_check)
+    models = tuple(dict.fromkeys(overlay_models))
+    if any(not isinstance(name, str) or not name for name in models):
+        raise ValueError(f"{MODELS_ENV} must be model names: {overlay_models!r}")
+    app.state.overlay_gate_prefix, app.state.overlay_gate_models = prefix, models
+    app.add_middleware(OverlayGateMiddleware, prefix=prefix, key_check=key_check, overlay_models=models)
 
 
 def side_salt(side: str, client) -> str:
@@ -199,11 +217,11 @@ def side_salt(side: str, client) -> str:
 class OverlayGateMiddleware:
     """Pure ASGI middleware. The gate itself is made at the first request, when the engine client is there."""
 
-    def __init__(self, app, prefix: str, key_check=None):
-        self.app, self.prefix = app, prefix
-        overlay = functools.partial(self._serve, "overlay")
+    def __init__(self, app, prefix: str, key_check=None, overlay_models=()):
+        self.app, self.prefix, self.overlay_models = app, prefix, frozenset(overlay_models)
+        under = functools.partial(self._serve, True)
         # what comes in under the prefix has not met the engine's key check on the path it is for: it meets it here
-        self._overlay = key_check(overlay) if key_check else overlay
+        self._under = key_check(under) if key_check else under
 
     def gate(self, scope) -> Gate:
         return gate_of(scope["app"].state)
@@ -217,14 +235,15 @@ class OverlayGateMiddleware:
         path = scope["path"]
         if path == self.prefix or path.startswith(self.prefix + "/"):
             inner = path[len(self.prefix):] or "/"
-            return await self._overlay(dict(scope, path=inner, raw_path=inner.encode()), receive, send)
-        return await self._serve("base", scope, receive, send)
+            return await self._under(dict(scope, path=inner, raw_path=inner.encode()), receive, send)
+        return await self._serve(False, scope, receive, send)
 
-    async def _serve(self, side: str, scope, receive, send):
+    async def _serve(self, under: bool, scope, receive, send):
+        """`under`: the request came in under the prefix (and `scope` already names the inner path)."""
         inner = scope["path"]
         if scope["method"] in ("GET", "HEAD", "OPTIONS") or inner in PASS_PATHS:
             return await self.app(scope, receive, send)
-        if inner in SWITCH_PATHS and side == "base":
+        if inner in SWITCH_PATHS and not under:
             return await self.app(scope, receive, send)              # the plugin's own route; it asks the gate itself
         if inner not in MODEL_PATHS:
             return await _answer(send, 403, f"{inner} is not served through the overlay gate")
@@ -239,6 +258,8 @@ class OverlayGateMiddleware:
             if request.get("background"):
                 raise GateError("a request run in the background is not served through the overlay gate: the model "
                                 "would run after the gate had let the request go", 400)
+            model = request.get("model")
+            side = "overlay" if under or (isinstance(model, str) and model in self.overlay_models) else "base"
             request["cache_salt"] = side_salt(side, request.get("cache_salt"))
             body = json.dumps(request).encode()
             gate = self.gate(scope)
@@ -246,11 +267,11 @@ class OverlayGateMiddleware:
         except GateError as e:
             return await _answer(send, e.status, str(e))
         try:
-            headers = [(k, v) for k, v in scope["headers"] if k.lower() != b"content-length"]
+            headers = [(k, v) for k, v in scope["headers"] if k.lower() not in (b"content-length", b"transfer-encoding")]
             headers.append((b"content-length", str(len(body)).encode()))
             await self.app(dict(scope, headers=headers), _replay(body, receive), _mark(send, side))
         finally:
-            await gate.leave()
+            gate.leave()
 
 
 async def _read_body(receive) -> bytes:
@@ -302,3 +323,7 @@ async def _answer(send, status: int, message: str) -> None:
 def prefix_from_env() -> str | None:
     value = os.environ.get(PREFIX_ENV, "").strip()
     return value or None
+
+
+def models_from_env() -> tuple[str, ...]:
+    return tuple(name.strip() for name in os.environ.get(MODELS_ENV, "").split(",") if name.strip())
