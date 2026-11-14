@@ -37,6 +37,25 @@ it. Nothing from that repository is included here. Only the one file above is us
 checkpoint the server loads stays the stock one: no index is rewritten and nothing is
 grafted into the shards.
 
+## Where the memory settings come from
+
+The recipe is leaner than the one it derives from, because these machines have little to
+spare with this model loaded. The settings came out of our own preparation for this
+cluster in October 2026, and that preparation stood on two pieces of other people's work:
+
+- Christopher Owen's [spark-ds41f](https://github.com/christopherowen/spark-ds41f)
+  (Apache-2.0) publishes memory figures and launch settings for three-machine runs of this
+  model. We planned against its figures, and two of our settings are also in its
+  configuration as we read it on 10 October 2026: `MAX_JOBS` 2 and
+  `--mm-processor-cache-gb 0`.
+- [Issue 404 of spark-vllm-docker](https://github.com/eugr/spark-vllm-docker/issues/404)
+  describes an engine that hangs after running out of memory during a kernel compile.
+  The limits on compile jobs (`B12X_COMPILE_WORKERS`, `MAX_JOBS`, `NINJAFLAGS`,
+  `MAKEFLAGS`, `FLASHINFER_NVCC_THREADS`) are there because of it.
+
+The other choices (text only, a 262,144 window, 2,048 batched tokens, CUDA graph capture
+up to 16) are ours. What they left free is in the table at the end.
+
 ## Hardware
 
 Three machines of the DGX Spark family (two NVIDIA DGX Spark and one Gigabyte AI TOP ATOM), each
