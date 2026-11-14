@@ -235,6 +235,18 @@ with the keys the engine itself uses (`--api-key`, else `VLLM_API_KEY`, as in
 inner path. If there is a key and that class cannot be imported, `attach_router` raises
 and the server does not start.
 
+**Reasoning effort.** The chat request's schema takes seven words for `reasoning_effort`
+(`vllm/entrypoints/openai/chat_completion/protocol.py:257-259`) and hands the value to the
+renderer as a chat-template argument (`:606-627`); arguments in `chat_template_kwargs`
+override it. The DeepSeek V4.1 renderer then accepts `none` (thinking off), the words of
+its own table, and integers from 1 to 100, and raises for anything else
+(`vllm/tokenizers/deepseek_v41.py:86-99`; the table `low` 50, `high` 75, `xhigh` 75, `max`
+100 is `vllm/tokenizers/deepseek_v41_encoding.py:185-192`). So `minimal` and `medium` pass
+the schema and fail the renderer, an integer passes the renderer only inside the kwargs,
+and a client that offers the seven words breaks on two of them. `effort.py` translates in
+the gate's rewrite step, in both places, and moves a top-level integer into the kwargs.
+Which word becomes which is the recipe's choice, not the code's.
+
 **Counting a request out.** A request leaves the count of those in flight in a plain
 function call, not an awaited one, in the `finally` of the app call: a request task that
 is being cancelled must still be counted out, and an awaited step there could be cut by a

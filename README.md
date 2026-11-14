@@ -38,6 +38,7 @@ unproven on any other setup until the acceptance test below has passed on yours.
 | Memory | six flips in a row left free memory where it was |
 | The gate (two endpoints on one server): who is let in when, the line, a failed or interrupted flip, what passes and what is refused, the API key under the prefix | unit tests with a stand-in engine and a stand-in server that records what the engine held while each request ran (`tests/test_gate.py`), and through FastAPI as the plugin installs it (`tests/test_api.py`). 31 faults made on purpose in the gate and its acceptance tool were each caught by a test. **Not run on hardware yet** |
 | The gate's acceptance tool | run against a stand-in server that can go wrong in each way the tool exists to catch (`tests/test_gate_acceptance.py`). Its rule for reading an answer was set after replaying real readings through it: see "Acceptance test" |
+| Choosing the side by model name; the translation of `reasoning_effort` | unit tests (`tests/test_gate.py`, `tests/test_effort.py`) and through FastAPI as the plugin installs them (`tests/test_api.py`). What the engine refuses today was read from a running server of the setup above: `minimal`, `medium` and unknown words in either place, integers at the top level, integers outside 1 to 100. **Not run on hardware yet** |
 | Not tested | the manual switch while requests are in flight or under load from several clients; the API-key check under the prefix on a real server (the stand-in copies the engine's rule); other tensor-parallel sizes; finding the checkpoint by its served name on hardware (the test setup named the folder with `OVERLAY_SWITCH_BASE_DIR`) |
 
 ## How it works
@@ -90,8 +91,9 @@ With [spark-vllm-docker](https://github.com/eugr/spark-vllm-docker):
 2. Merge the four items of [examples/recipe-additions.yaml](examples/recipe-additions.yaml)
    into your recipe: the mod, `VLLM_PLUGINS`, `OVERLAY_SWITCH_FILE`, and
    `--worker-extension-cls vllm_overlay_switch.worker.OverlayWorkerExtension`. A fifth,
-   `OVERLAY_GATE_PREFIX`, turns on the two endpoints described below, and a sixth,
-   `OVERLAY_GATE_MODELS`, lets the model name choose between them.
+   `OVERLAY_GATE_PREFIX`, turns on the two endpoints described below, a sixth,
+   `OVERLAY_GATE_MODELS`, lets the model name choose between them, and the
+   `OVERLAY_GATE_EFFORT_*` settings translate `reasoning_effort`.
 3. Launch as usual. The mod prints the exact `VLLM_PLUGINS` value for your image; that
    variable is an allow-list for every vLLM plugin, so it has to name the ones the image
    already loads as well. In the server log, look for
@@ -197,6 +199,44 @@ has a key and the engine's check cannot be found, the server does not start.
 is live, how many requests are in flight and waiting, how many flips so far, and the
 seconds requests have spent waiting at the gate.
 
+## Reasoning effort from a client with a ladder of its own
+
+Clients send `reasoning_effort` from whatever ladder they were written with. The engine's
+request schema takes seven words; a model's own renderer may take fewer and answer the
+others with HTTP 400, and every such client then breaks until it carries a workaround.
+The gate rewrites every chat request anyway, so it can put the field into words the
+model takes, for both sides alike. Off unless the first of these is set:
+
+```
+OVERLAY_GATE_EFFORT_KEEP=none,low,high,xhigh,max
+OVERLAY_GATE_EFFORT_MAP=minimal=low,medium=high,ultra=max,*=high
+OVERLAY_GATE_EFFORT_INT=1-100
+```
+
+| A request sends | The engine gets |
+|---|---|
+| a word on the keep list | the same word |
+| a word on the map | what the map says (`medium` becomes `high` above) |
+| any other value, with `*` on the map | what `*` says, and the note says "unknown" |
+| an integer, with a range set | the integer, clamped into the range |
+| a number written as a string or a float (`"50"`, `50.0`) | that integer |
+| nothing | nothing: the request is not touched |
+
+It applies to `/v1/chat/completions`, at the top level and inside
+`chat_template_kwargs` alike. An integer that ends up at the top level is moved into
+`chat_template_kwargs`, because the engine's schema takes only words at the top level
+and integers only there.
+
+Nothing is rewritten silently. The answer carries what was done in a header
+(`x-reasoning-effort: medium -> high`), the status route counts each translation, and
+the server log names each distinct one once (`reasoning_effort coerced: medium -> high
+(model=...)`). `GET /v1/models` gains per model `reasoning_efforts` (the keep list),
+`reasoning_effort_aliases` (the map) and `reasoning_effort_integer_min` / `_max`, so a
+client can read what the model takes instead of hardcoding a ladder. A map that leads to
+a value the keep list and the range do not cover is refused when the server starts.
+
+It needs the gate (`OVERLAY_GATE_PREFIX`); without it no request is read at all.
+
 ## Acceptance test
 
 ```sh
@@ -229,7 +269,10 @@ python3 tools/gate_acceptance.py http://HOST:8000 MODEL_NAME --prefix /free --ou
 
 With `--overlay-model OVERLAY_NAME` it asks for the overlay by name as well: every other
 mixed request for the overlay goes over the usual path under that name, and the cache
-check asks once by name for what was cached under the prefix.
+check asks once by name for what was cached under the prefix. With `--effort-check` it
+sends the efforts a seven-step client may send (`medium`, `minimal`, `ultra`, a made-up
+word, 50, 0, 101), at the top level and in `chat_template_kwargs`, on every way in: each
+must be answered 200 and the model list must say what the model accepts.
 
 It answers four questions, three of them exactly.
 

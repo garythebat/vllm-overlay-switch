@@ -1,7 +1,7 @@
 # What to add to a recipe of eugr/spark-vllm-docker to get the overlay switch.
 #
 # This is a fragment, not a recipe: merge the four marked items into the recipe you already
-# serve the BASE checkpoint with (the fifth and sixth are optional). Paths are placeholders. Not
+# serve the BASE checkpoint with (the fifth to seventh are optional). Paths are placeholders. Not
 # run as written; see the README for what has and has not been tested.
 
 mods:
@@ -28,6 +28,14 @@ env:
   #     that pick from the model list. Serve them as further names of the one model: add
   #     `--served-model-name BASE_NAME OVERLAY_NAME` to the command, the base name first.
   # OVERLAY_GATE_MODELS: "OVERLAY_NAME"
+
+  # (7) Optional, with (5): put reasoning_effort into words the model takes, for clients with a
+  #     ladder of their own. KEEP turns it on: the words passed on as they are. MAP rewrites
+  #     words (`*` is any other value). INT accepts integers and clamps them into the range.
+  #     The values below fit DeepSeek V4.1 on the engine build named in the README.
+  # OVERLAY_GATE_EFFORT_KEEP: "none,low,high,xhigh,max"
+  # OVERLAY_GATE_EFFORT_MAP: "minimal=low,medium=high,ultra=max,*=high"
+  # OVERLAY_GATE_EFFORT_INT: "1-100"
 
   # Optional. Who may call the switch besides the machine the server runs on, and a shared
   # secret that every call must then carry in the X-Overlay-Token header.
