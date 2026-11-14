@@ -1,8 +1,8 @@
 # What to add to a recipe of eugr/spark-vllm-docker to get the overlay switch.
 #
 # This is a fragment, not a recipe: merge the four marked items into the recipe you already
-# serve the BASE checkpoint with (the fifth is optional). Paths are placeholders. Not run as
-# written; see the README for what has and has not been tested.
+# serve the BASE checkpoint with (the fifth and sixth are optional). Paths are placeholders. Not
+# run as written; see the README for what has and has not been tested.
 
 mods:
   - mods/overlay-switch        # (1) a copy of this repository's mod/ folder inside your
@@ -23,6 +23,11 @@ env:
   #     (http://HOST:8000/free/v1), and the server flips by itself. Leave it out to keep
   #     one endpoint and flip by hand.
   # OVERLAY_GATE_PREFIX: "/free"
+
+  # (6) Optional, with (5): model names that mean the overlay on the usual paths, for clients
+  #     that pick from the model list. Serve them as further names of the one model: add
+  #     `--served-model-name BASE_NAME OVERLAY_NAME` to the command, the base name first.
+  # OVERLAY_GATE_MODELS: "OVERLAY_NAME"
 
   # Optional. Who may call the switch besides the machine the server runs on, and a shared
   # secret that every call must then carry in the X-Overlay-Token header.

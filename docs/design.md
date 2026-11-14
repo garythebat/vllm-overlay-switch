@@ -180,6 +180,15 @@ the innermost one: it sees a request after CORS, the API key, the request id and
 `--middleware` names, and nothing stands between it and the routes. The installer checks
 that order in the engine it installs into.
 
+**Which side a request is for.** Under the prefix: the overlay. On the usual paths: the
+base, unless the request's `model` is one of the names in `OVERLAY_GATE_MODELS`. Those
+names are further served names of the one model (`--served-model-name` takes several;
+the model list shows one entry per name, `vllm/entrypoints/launchers/api_server/app_state.py:59-61`,
+and answers carry the first, `vllm/entrypoints/openai/models/serving.py:144-147`), so a
+client that picks from the list finds both sides under one address. The gate reads the
+name from the body it parses anyway; a `model` that is not a string chooses nothing and is
+left for the engine to refuse.
+
 **Admission, not the engine's pause.** The kernel takes one set of weights for everything
 it decodes together (`vllm/models/deepseek_v4_1/attention.py:1754-1767`), so the two sides
 have to take turns. The engine's pause cannot arrange that by itself: what arrives while
@@ -207,8 +216,10 @@ flips with `pause_generation(clear_cache=False)`
 exactly one `cache_salt`, so a client cannot slip in a second one.
 
 **What must not pass.** Only requests the gate has marked may run the model. So it lets
-through `GET`, `HEAD` and `OPTIONS`, two routes that do not run the model, and the four
-that do and take a salt; every other route answers 403, and a websocket is closed. A
+through `GET`, `HEAD` and `OPTIONS`, three routes that render and count without running
+the model (`/v1/messages/count_tokens` only renders the request and counts: the
+`count_tokens` handler of the messages API), and the four that run it and
+take a salt; every other route answers 403, and a websocket is closed. A
 `/v1/responses` request with `background` set is refused too: the engine answers such a
 request at once and runs the model afterwards in a task of its own
 (`vllm/entrypoints/openai/responses/serving.py:508-556`), which is after the gate has
@@ -223,6 +234,11 @@ with the keys the engine itself uses (`--api-key`, else `VLLM_API_KEY`, as in
 `register.py:33-37`) and the gate runs everything under the prefix through it, on the
 inner path. If there is a key and that class cannot be imported, `attach_router` raises
 and the server does not start.
+
+**Counting a request out.** A request leaves the count of those in flight in a plain
+function call, not an awaited one, in the `finally` of the app call: a request task that
+is being cancelled must still be counted out, and an awaited step there could be cut by a
+second cancellation, after which the other side would wait for ever.
 
 **When a flip goes wrong.** A flip that fails and puts the previous set back answers 503
 to the request that asked for it, and the live side goes on serving. A flip that leaves

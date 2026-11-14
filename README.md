@@ -90,7 +90,8 @@ With [spark-vllm-docker](https://github.com/eugr/spark-vllm-docker):
 2. Merge the four items of [examples/recipe-additions.yaml](examples/recipe-additions.yaml)
    into your recipe: the mod, `VLLM_PLUGINS`, `OVERLAY_SWITCH_FILE`, and
    `--worker-extension-cls vllm_overlay_switch.worker.OverlayWorkerExtension`. A fifth,
-   `OVERLAY_GATE_PREFIX`, turns on the two endpoints described below.
+   `OVERLAY_GATE_PREFIX`, turns on the two endpoints described below, and a sixth,
+   `OVERLAY_GATE_MODELS`, lets the model name choose between them.
 3. Launch as usual. The mod prints the exact `VLLM_PLUGINS` value for your image; that
    variable is an allow-list for every vLLM plugin, so it has to name the ones the image
    already loads as well. In the server log, look for
@@ -138,6 +139,21 @@ A client picks a side by the base URL it is given and needs nothing else. The se
 model name is the same on both. Every answer of a request that ran the model carries a
 header, `x-overlay-side: base` or `overlay`.
 
+Some clients pick from the server's model list instead of taking a base URL. For those,
+give the one model a second served name and tell the gate that this name means the
+overlay:
+
+```
+vllm serve ... --served-model-name BASE_NAME OVERLAY_NAME
+OVERLAY_GATE_MODELS=OVERLAY_NAME
+```
+
+`GET /v1/models` then lists both names under the one address, and a request on the usual
+paths that names `OVERLAY_NAME` gets the overlay. Under the prefix every request gets the
+overlay, whatever it names. The engine puts the first served name into the `model` field
+of every answer and into its metrics, so name the base first; the header says which side
+answered.
+
 What the gate does:
 
 - Requests for the side that is live are let in as they come and run together, as
@@ -161,10 +177,11 @@ that on every request.
 
 What it refuses, so that nothing can run the model behind its back:
 
-- Any route it does not know. Let through are `GET` requests, `/tokenize`,
-  `/detokenize`, and the four routes that run the model and take a cache salt:
-  `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`.
-  Embeddings, scoring, the realtime websocket and the rest answer 403 or are closed.
+- Any route it does not know. Let through are `GET` requests, three routes that only
+  count (`/tokenize`, `/detokenize`, `/v1/messages/count_tokens`), and the four that run
+  the model and take a cache salt: `/v1/chat/completions`, `/v1/completions`,
+  `/v1/responses`, `/v1/messages`. Embeddings, scoring, the realtime websocket and the
+  rest answer 403 or are closed.
 - A request that asks to be run in the background (`"background": true` on
   `/v1/responses`): the model would run after the gate had let it go.
 - A flip by hand. `POST /overlay/switch` then only takes `"force": true`, the way out
@@ -176,9 +193,9 @@ more), and `/free/v1/...` does not begin that way. The gate therefore runs the e
 own key check again for everything under the prefix, with the same keys. If the server
 has a key and the engine's check cannot be found, the server does not start.
 
-`GET /overlay/status` then also reports the gate: which side is live, how many requests
-are in flight and waiting, how many flips so far, and the seconds requests have spent
-waiting at the gate.
+`GET /overlay/status` then also reports the gate: its prefix and model names, which side
+is live, how many requests are in flight and waiting, how many flips so far, and the
+seconds requests have spent waiting at the gate.
 
 ## Acceptance test
 
@@ -209,6 +226,10 @@ For a gated server:
 ```sh
 python3 tools/gate_acceptance.py http://HOST:8000 MODEL_NAME --prefix /free --out report.json
 ```
+
+With `--overlay-model OVERLAY_NAME` it asks for the overlay by name as well: every other
+mixed request for the overlay goes over the usual path under that name, and the cache
+check asks once by name for what was cached under the prefix.
 
 It answers four questions, three of them exactly.
 
@@ -244,6 +265,11 @@ the other group, 31 in the stretch between, and none passed as its label.
   for by taking turns, not by running both at once.
 - Behind the gate a request for the other side waits as long as the longest request in
   flight. A client that never finishes reading its answer holds the other side up.
+- A client that gives up while its request is still waiting at the gate keeps its place
+  in the line. When its turn comes the server flips for it, and the engine then drops
+  the request: a flip for nothing.
+- The gate needs a single API server process (`--api-server-count 1`, the default without
+  data parallelism) and refuses to start otherwise: its line lives in one process.
 - The gate has not been tried with `--root-path`, and it holds a request's whole body in
   memory to mark it (up to 64 MB).
 - The switched tensors are read from disk at every flip.
