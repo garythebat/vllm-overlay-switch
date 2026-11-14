@@ -126,7 +126,8 @@ Not yet tested:
   variants at once (the test prompts are short), a client that disconnects while queued,
   and a server started with `--root-path`
 
-To check your own deployment, see [Verifying a deployment](#verifying-a-deployment).
+To check your own deployment, see [Verifying a deployment](#verifying-a-deployment). The
+unit-test coverage and the detailed measurements are in [docs/testing.md](docs/testing.md).
 
 ## Installation
 
@@ -435,7 +436,8 @@ purpose, 185 of 216 failed, 31 were inconclusive and none passed.
 python3 -m unittest discover -s tests -v
 ```
 
-159 unit tests, none of which needs a GPU. `tests/test_worker.py` needs torch and numpy,
+159 unit tests, none of which needs a GPU ([what they cover](docs/testing.md)).
+`tests/test_worker.py` needs torch and numpy,
 and `tests/test_api.py` needs fastapi and httpx; each is skipped when its packages are
 missing. The rest needs only the standard library.
 
