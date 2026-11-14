@@ -16,8 +16,9 @@ base weights and can be flipped to the overlay, and back, with one call.
 
 ## Status
 
-**Written, and tested off the hardware. It has not yet run on a GPU or inside the real
-engine.** Treat it as unproven until the acceptance test below has passed on your setup.
+**Run on one setup: three machines with one GPU each (DGX Spark), tensor parallel 3, the
+engine build under Scope, 14 November 2026. The acceptance test passed there.** Treat it as
+unproven on any other setup until the acceptance test below has passed on yours.
 
 | Part | How it has been checked |
 |---|---|
@@ -26,9 +27,14 @@ engine.** Treat it as unproven until the acceptance test below has passed on you
 | Reading tensors out of safetensors files | unit tests on hand-made files (`tests/test_stfile.py`) |
 | The worker half: which columns a rank holds, overwriting in place, reading back, leaving padding alone, refusing what it does not understand | unit tests with real torch tensors (torch 2.13.0, the engine image's version, CPU build), real files, three simulated ranks, and stand-ins for the engine's modules (`tests/test_worker.py`) |
 | That the code fits the engine | read against the engine source at the commits listed under Scope; references in [docs/design.md](docs/design.md) |
-| The installer `mod/run.sh` | dry run against a folder laid out like the image's package folder: install, install again, two refusals. Not yet run inside an image |
-| The acceptance tool itself | run against a stand-in server whose behaviour is known: a pass, both failure verdicts, and "cannot tell" (`tests/test_acceptance.py`) |
-| A flip on a GPU, under captured CUDA graphs, across machines | **not run.** This is what `tools/acceptance.py` is for |
+| The installer `mod/run.sh` | dry run against a folder laid out like the image's package folder; then run inside the image on each of the three machines at every launch. It found no plugins in the image beyond vLLM's own two |
+| The acceptance tool itself | run against a stand-in server whose behaviour is known: a pass, each failure verdict, a drift between readings, an older switch without the digest, "cannot tell" (`tests/test_acceptance.py`) |
+| A flip on a GPU, under captured CUDA graphs, across machines | run. Preparing took 3.9 s; a flip 1.4 to 2.0 s end to end, of which the pause before the copy is 0.03 s. After every flip each machine read all its tensors back as the set asked for |
+| That flipping back restores the model | exact: the digest of everything derived from the switched weights, read on a freshly started server before anything was prepared, was the same on every rank after flipping to the overlay and back. Seen on two separate launches |
+| That the model reads what a flip wrote | six independent passes per set: five of eight prompts told the two sets apart (every margin of one set on one side, every margin of the other on the other) |
+| That the flipped state is the overlay model | the overlay was also loaded as a model of its own and read with `--read-only`. Wherever base and flipped stood apart, it lay on the flipped side with nearly the same medians, and at none of 34 positions did it stand apart from the flipped state |
+| Memory | six flips in a row left free memory where it was |
+| Not tested | a flip while requests are in flight or under load from several clients; other tensor-parallel sizes; finding the checkpoint by its served name on hardware (the test setup named the folder with `OVERLAY_SWITCH_BASE_DIR`) |
 
 ## How it works
 
@@ -119,12 +125,23 @@ curl -s -X POST http://127.0.0.1:8000/overlay/switch -H 'Content-Type: applicati
 python3 tools/acceptance.py http://127.0.0.1:8000 MODEL_NAME --out report.json
 ```
 
-It asks a few plain prompts at temperature 0 on the live set, flips, asks again, flips
-back and asks again, and compares the next-token choices at the first place the
-answers part, where every answer was produced from an identical context. It passes when
-the two sets choose differently there, each repeatably, and the choices after flipping
-back are the first ones again. It needs no reference answers and asks nothing
-sensitive. Details and the reasoning are at the top of the file.
+It reads the live set several times (a few plain prompts at temperature 0), flips, reads
+the other set, flips back and reads again. At every position where all answers had read
+the same words it compares, by set, the margin between the most chosen token and its
+strongest rival. It passes when at least two prompts tell the sets apart and flipping
+back restores the model: exactly, by a digest of everything derived from the switched
+weights that the status route reports with `?full=1`.
+
+Identical requests do not return identical numbers on every deployment. On the setup
+above they moved a margin by one to three logits, which is why the test reads each set
+six times, gives every request its own `cache_salt`, and judges whether two groups of
+margins overlap at all. The first version of this test compared single choices over
+two passes and reported a failed return that was not one. It needs no reference
+answers and asks nothing sensitive. Details and the reasoning are at the top of the
+file and in [docs/design.md](docs/design.md).
+
+`--read-only` reads a server without touching any switch and saves the answers, for a
+reference reading to set beside the flipped state.
 
 ## Limits
 

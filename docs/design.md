@@ -1,7 +1,7 @@
 # Design
 
-Status: written from a reading of the engine source and tested off the hardware (see the
-table in the README). It has not run on a GPU yet. Every reference below is to the pinned
+Status: written from a reading of the engine source, tested off the hardware, and run on
+one setup on 14 November 2026 (see the table in the README). Every reference below is to the pinned
 commits listed in the README; `path:line` is in the vLLM fork unless it starts with
 `flashinfer/`.
 
@@ -174,10 +174,13 @@ of it are held on the CPU side, and the packing function allocates scratch on th
 device, which is released at the end. A flip reads every file tensor whole, about
 1.1 GB per rank; preparing reads both sets once, about 2.2 GB.
 
-The file's sizes are read from the file. What a rank writes, the scratch the packing
-needs and the time a flip takes have not been measured yet. An earlier version of this
-section gave per-rank sizes worked out from an assumed shape; they were wrong and are
-gone.
+Measured on the tested setup (three ranks): each rank holds 3,072 columns, the eight
+groups being padded to nine; two ranks write 409 MB per flip and the third, which holds
+2,048 real columns, 273 MB. Preparing took 3.9 s. A flip took 1.4 to 2.0 s end to end;
+the pause before the copy was 0.03 s and the rest is the copy and reading every tensor
+back. Six flips in a row left the machines' free memory where it was. A full status,
+which reads every tensor back and fingerprints the derived ones, took about three
+seconds; that is why the fingerprint is not part of a flip.
 
 ## Acceptance test
 
@@ -221,13 +224,22 @@ test says how many positions it looked at so that the figure can be read against
 reference, for instance of the overlay loaded as a model of its own, to set beside the
 flipped state.
 
-## Open questions, to be settled by running it
+## What running it settled, and what it did not
 
-- Do captured graphs follow an in-place overwrite here, as the reload code implies?
-  The acceptance test answers this.
-- Does anything else keep its own copy of these weights? None was found in the reading;
-  the acceptance test would show it.
-- How long does a flip take?
-- Does the installed image register plugins beyond vLLM's own two, which `VLLM_PLUGINS`
-  would have to name? The installer prints what it finds.
+On the tested setup (14 November 2026):
+
+- Captured graphs follow an in-place overwrite: the answers changed with a flip and
+  returned with the flip back, and the overlay loaded as a model of its own read like
+  the flipped state at every position that told base and flipped apart.
+- Nothing else showed up that keeps its own copy of these weights: the same comparison
+  would have shown a state that was neither base nor overlay.
+- The packing function is deterministic: the digest of the derived tensors after
+  flipping there and back equalled the one the startup left, on two separate launches,
+  and the startup's own digests were the same on both.
+- The image registered no plugins beyond vLLM's own two.
+
+Still open:
+
 - Worker and queue state after a `collective_rpc` timeout.
+- A flip while requests are in flight, and under load from several clients.
+- Other tensor-parallel sizes, where the padding falls differently.
