@@ -68,9 +68,11 @@ the two sets never run at once: mixed traffic takes turns, as the limits below d
 
 ## Status
 
-**Run on one setup: three machines with one GPU each (DGX Spark), tensor parallel 3, the
-engine build under Scope, 14 November 2026. The acceptance test passed there.** Treat it as
-unproven on any other setup until the acceptance test below has passed on yours.
+This has run on one cluster so far: three machines of the DGX Spark family serving
+DeepSeek V4.1 Flash together, on the engine build listed under [Scope](#scope). On
+14 November 2026 it passed its acceptance test there, on two memory settings. On a
+different setup, run the [acceptance test](#acceptance-test) first. Here it took under
+four minutes.
 
 | Part | How it has been checked |
 |---|---|
