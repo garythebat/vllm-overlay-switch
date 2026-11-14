@@ -57,7 +57,7 @@ class StandIn(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         b, path = self.b, self.path.removeprefix("/free")
         if path == "/v1/models":
-            return self.answer(200, {"data": [{"id": "m"}]})
+            return self.answer(200, {"data": [{"id": "m"}, {"id": "m-free"}]})      # one model under two names
         if path == "/metrics" and not b.get("no_metrics"):
             with self.lock:
                 text = METRICS.format(queried=float(b["queried"]), hit=float(b["hit"]), stopped=float(b["finished"]), length=0.0)
@@ -73,7 +73,8 @@ class StandIn(http.server.BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         if self.path not in ("/v1/chat/completions", "/free/v1/chat/completions"):
             return self.answer(404, {"detail": "Not Found"})
-        asked = "overlay" if self.path.startswith("/free/") else "base"
+        by_name = body.get("model") == "m-free" and not self.path.startswith("/free/") and not b.get("name_ignored")
+        asked = "overlay" if self.path.startswith("/free/") or by_name else "base"
         prompt = body["messages"][0]["content"]
         tag = body["cache_salt"].split("-")[1]                 # ref, turn, burst, cache or rest: which part of the test asks
         tokens = len(prompt.split()) + 4
@@ -87,7 +88,9 @@ class StandIn(http.server.BaseHTTPRequestHandler):
             odd_one = tag in ("turn", "burst") and asked == "overlay" and b["count"] % 5 == 0
             leak, hybrid = b.get("leaks") and odd_one, b.get("hybrid") and odd_one
             noise = 0.0 if leak or hybrid else b["rng"].uniform(-0.6, 0.6)
-            key = (None if b.get("shared_cache") else asked, body["cache_salt"], prompt)
+            b["by_name"] = b.get("by_name", 0) + by_name
+            key = (None if b.get("shared_cache") else "named" if by_name and b.get("name_other_cache") else asked,
+                   body["cache_salt"], prompt)
             reused = 0 if key not in b["cache"] or b.get("no_reuse") else (tokens - 1) // 16 * 16
             b["cache"].add(key)
             b["queried"] += tokens
@@ -148,6 +151,32 @@ class Tool(unittest.TestCase):
         # 2 endpoints x 4 passes x 8 prompts; 4 prompts with a landmark: 2 rounds in turn, 1 burst; 5 for the cache; 1 to rest on base
         self.assertEqual(StandIn.b["count"], 64 + 16 + 8 + 5 + 1)
         self.assertEqual(StandIn.b["live"], "base")
+
+    def test_the_overlay_asked_for_by_name_is_tested_the_same_way(self):
+        status, text = self.run_tool("--overlay-model", "m-free", "--copies", "2", "--status", self.url)
+        self.assertEqual(status, 0, text)
+        self.assertIn("of the mixed requests for the overlay, 8 asked by the name 'm-free' on the usual path and 8 under /free", text)
+        self.assertIn("the overlay again 512, the overlay by name 512, base after two flips 512", text)
+        self.assertIn("the gate counted 16 flips for the 16 requests asked in turn", text)
+        # reference 64; in turn 16; one burst of 2 copies x 4 prompts x 2 sides; 6 for the cache; 1 to rest on base
+        self.assertEqual((StandIn.b["count"], StandIn.b["by_name"]), (64 + 16 + 16 + 6 + 1, 4 + 4 + 1))
+
+    def test_a_name_the_gate_ignores_fails_by_its_mark(self):
+        status, text = self.run_tool("--overlay-model", "m-free", name_ignored=True)
+        self.assertEqual(status, 1, text)
+        self.assertIn("asked 'overlay', marked 'base'", text)
+
+    def test_a_name_with_a_cache_of_its_own_fails(self):
+        status, text = self.run_tool("--overlay-model", "m-free", name_other_cache=True)
+        self.assertEqual(status, 1, text)
+        self.assertIn("asked for by name, the overlay reused nothing of the 512 tokens it had cached under the prefix", text)
+        self.assertIn("two ways in that should be one side", text)
+
+    def test_a_name_the_server_does_not_serve_is_not_asked(self):
+        status, text = self.run_tool("--overlay-model", "nobody")
+        self.assertEqual(status, 3, text)
+        self.assertIn("not 'nobody'", text)
+        self.assertEqual(StandIn.b["count"], 0)
 
     def test_one_request_in_five_on_the_wrong_weights_fails_and_is_shown(self):
         status, text = self.run_tool(leaks=True)

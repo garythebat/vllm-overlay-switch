@@ -86,9 +86,10 @@ def call(url, body=None, headers=None, timeout=900, with_headers=False):
         return (*got, dict(e.headers or {})) if with_headers else got
 
 
-def ask(args, prompt, salt, base=None):
-    """One answer with its tokens and their alternatives. `base` overrides the server's URL (another path prefix)."""
-    body = {"model": args.model, "messages": [{"role": "user", "content": prompt}], "max_tokens": args.max_tokens,
+def ask(args, prompt, salt, base=None, model=None):
+    """One answer with its tokens and their alternatives. `base` overrides the server's URL (another path
+    prefix), `model` the name asked for (another served name of the same model)."""
+    body = {"model": model or args.model, "messages": [{"role": "user", "content": prompt}], "max_tokens": args.max_tokens,
             "temperature": 0, "logprobs": True, "top_logprobs": args.top}
     if salt:
         body["cache_salt"] = salt          # a fresh computation: nothing cached under another salt is reused

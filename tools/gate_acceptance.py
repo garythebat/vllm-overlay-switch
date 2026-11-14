@@ -40,6 +40,11 @@ Do the two sides keep their cached prefixes apart, and does a flip leave them al
 Did the server flip as often as the side changed?  (exact, with --status)
     The gate counts its flips. The count is read before and after the requests asked in turn.
 
+With --overlay-model NAME the overlay is also asked for by name on the usual paths (a server
+started with OVERLAY_GATE_MODELS): every other mixed request for the overlay goes that way, and
+the cache check asks once by name for what was cached under the prefix. The same four questions
+then cover both ways in.
+
     python3 tools/gate_acceptance.py http://HOST:8000 MODEL_NAME --prefix /free --out report.json
 
 Exit status: 0 passed; 1 shown not to work; 2 cannot tell (too few landmarks, or the cache
@@ -76,10 +81,14 @@ def auth(args):
     return {"Authorization": f"Bearer {args.api_key}"} if args.api_key else {}
 
 
-def read(args, side, tag, k, i):
+def read(args, side, tag, k, i, by_name=False):
+    """One answer. `by_name`: ask for the overlay on the usual path, by the model name that chooses it."""
     started = time.monotonic()
-    answer = acceptance.ask(args, PROMPTS[i], f"{args.nonce}-{tag}-{side}-{k}-{i}", base=endpoint(args, side))
-    return {**answer, "asked": side, "index": i, "phase": tag, "seconds": round(time.monotonic() - started, 3)}
+    by_name = by_name and side == "overlay"
+    answer = acceptance.ask(args, PROMPTS[i], f"{args.nonce}-{tag}-{side}-{k}-{i}", base=args.server if by_name else endpoint(args, side),
+                            model=args.overlay_model if by_name else None)
+    return {**answer, "asked": side, "via": "name" if by_name else "prefix" if side == "overlay" else "usual", "index": i,
+            "phase": tag, "seconds": round(time.monotonic() - started, 3)}
 
 
 # ---- landmarks: where the reference tells the two sides apart, and where a later answer lies there
@@ -148,7 +157,8 @@ def judge(mixed, marks):
             if where != "own":
                 (strays if where == "other" else between).append(
                     {"prompt": PROMPTS[answer["index"]], "position": mark["position"], "asked": answer["asked"],
-                     "phase": answer["phase"], "margin": margin, "middle": mark["middle"], "edge": mark["edge"], "text": answer["text"]})
+                     "phase": answer["phase"], "via": answer.get("via"), "margin": margin, "middle": mark["middle"],
+                     "edge": mark["edge"], "text": answer["text"]})
         placed += anywhere
         unplaced += not anywhere
     return strays, between, placed, unplaced
@@ -175,12 +185,14 @@ def counters(args):
 
 def cache_step(args, side, salt, name):
     """One request for the long prompt, with what the server's counters did around it."""
+    by_name = name.endswith("by name")
     before = counters(args)
-    body = {"model": args.model, "messages": [{"role": "user", "content": LONG}], "max_tokens": 8, "temperature": 0,
-            "cache_salt": salt}
+    body = {"model": args.overlay_model if by_name else args.model, "messages": [{"role": "user", "content": LONG}],
+            "max_tokens": 8, "temperature": 0, "cache_salt": salt}
     if args.thinking_kwarg:
         body["chat_template_kwargs"] = {args.thinking_kwarg: False}
-    status, answer, headers = acceptance.call(endpoint(args, side) + "/v1/chat/completions", body, auth(args), with_headers=True)
+    url = (args.server if by_name else endpoint(args, side)) + "/v1/chat/completions"
+    status, answer, headers = acceptance.call(url, body, auth(args), with_headers=True)
     if status != 200:
         raise acceptance.CouldNotRun(f"the server answered {status} to the long prompt: {str(answer)[:300]}")
     deadline = time.monotonic() + args.counter_wait
@@ -201,12 +213,16 @@ def cache_check(args):
     if counters(args) is None:
         return {"verdict": "not measured", "why": "the server's /metrics page does not give the prefix cache counters", "attempts": []}
     attempts = []
+    plan = list(CACHE_STEPS)
+    if args.overlay_model:
+        plan.insert(4, ("overlay", "the overlay by name"))    # after the overlay's own repeat, before going back to base
     for attempt in range(args.cache_attempts):
         salt = f"{args.nonce}-cache-{attempt}"          # the same client salt on both endpoints: only the gate keeps them apart
-        steps = [cache_step(args, side, salt, name) for side, name in CACHE_STEPS]
+        steps = [cache_step(args, side, salt, name) for side, name in plan]
         attempts.append(steps)
         if any(s.get("finished") != 1 or s.get("queried") != s["prompt_tokens"] for s in steps):
             continue                                      # other requests ran meanwhile: these numbers prove nothing
+        named = steps.pop(4)["hit"] if args.overlay_model else None
         first, again, other, other_again, back = (s["hit"] for s in steps)
         if first:
             continue                                      # a salt never used before found something cached: not understood
@@ -221,9 +237,13 @@ def cache_check(args):
         if not back:
             return {"verdict": "cleared", "attempts": attempts,
                     "why": f"after going to the overlay and back, base reused nothing of the {again} tokens it had cached"}
+        if named == 0:
+            return {"verdict": "name apart", "attempts": attempts,
+                    "why": f"asked for by name, the overlay reused nothing of the {other_again} tokens it had cached under the prefix"}
         return {"verdict": "apart", "attempts": attempts,
                 "why": f"of {steps[0]['prompt_tokens']} tokens: base again reused {again}, the overlay's first request 0, "
-                       f"the overlay again {other_again}, base after two flips {back}"}
+                       f"the overlay again {other_again}, " + (f"the overlay by name {named}, " if named is not None else "")
+                       + f"base after two flips {back}"}
     return {"verdict": "not measured", "attempts": attempts,
             "why": f"in {len(attempts)} attempts the counters never moved by exactly this test's own requests (other traffic?)"}
 
@@ -233,6 +253,8 @@ def main():
     parser.add_argument("server", help="base URL of the server, e.g. http://127.0.0.1:8000")
     parser.add_argument("model", help="the served model name")
     parser.add_argument("--prefix", default="/free", help="the path prefix under which the overlay answers (default /free)")
+    parser.add_argument("--overlay-model", help="a model name that chooses the overlay on the usual paths; it is then asked "
+                                                "for that way too")
     parser.add_argument("--api-key", help="API key of the server, if it has one")
     parser.add_argument("--passes", type=int, default=6, help="reference readings of each endpoint (default 6)")
     parser.add_argument("--mixed", type=int, default=6, help="rounds asked in turn, a flip before every request (default 6)")
@@ -261,6 +283,8 @@ def main():
         if args.model not in served:
             raise acceptance.CouldNotRun(f"{endpoint(args, side)} answered {code} and serves {served}, not {args.model!r}: "
                                          f"{'is the gate installed under ' + args.prefix + '?' if side == 'overlay' else 'nothing asked'}")
+        if args.overlay_model and args.overlay_model not in served:
+            raise acceptance.CouldNotRun(f"{endpoint(args, side)} serves {served}, not {args.overlay_model!r}: nothing asked")
 
     def gate_counters():
         if not args.status:
@@ -285,16 +309,17 @@ def main():
     if telling:
         gate_before = gate_counters()
         print(f"mixed, in turn: {args.mixed} rounds of {len(telling)} prompts, the other endpoint at every request", flush=True)
-        for k in range(args.mixed):
+        for k in range(args.mixed):                       # with --overlay-model every other round asks for the overlay by name
             for i in telling:
-                mixed += [read(args, side, "turn", k, i) for side in SIDES]
+                mixed += [read(args, side, "turn", k, i, by_name=bool(args.overlay_model) and k % 2 == 1) for side in SIDES]
         in_turn = len(mixed)
         gate_after = gate_counters()
         jobs = [(side, i, c) for c in range(args.copies) for i in telling for side in SIDES]
         print(f"mixed, at once: {args.burst} bursts of {len(jobs)} requests", flush=True)
         for k in range(args.burst):
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
-                mixed += list(pool.map(lambda job: read(args, job[0], "burst", f"{k}.{job[2]}", job[1]), jobs))
+                mixed += list(pool.map(lambda job: read(args, job[0], "burst", f"{k}.{job[2]}", job[1],
+                                                        by_name=bool(args.overlay_model) and job[2] % 2 == 1), jobs))
     cache = None
     if not args.no_cache_check:
         print("the cache: one long prompt, five requests, the server's counters around each", flush=True)
@@ -316,7 +341,7 @@ def main():
                       + (f"   mixed {mix[0]:+.2f} to {mix[-1]:+.2f} ({len(mix)} answers)" if mix else "   mixed: none reached it"))
     for label, rows in (("ON THE WRONG SIDE", strays), ("between the two", between)):
         for row in rows:
-            print(f"{label}: asked on {row['asked']} ({row['phase']}), token {row['position']} of {row['prompt'][:50]!r}: margin "
+            print(f"{label}: asked on {row['asked']} ({row['phase']}, {row['via']}), token {row['position']} of {row['prompt'][:50]!r}: margin "
                   f"{row['margin']:+.2f}; middle {row['middle']:+.2f}, base from {row['edge']['base']:+.2f}, overlay from {row['edge']['overlay']:+.2f}")
 
     def mean(rows):
@@ -325,6 +350,9 @@ def main():
     turned = [a for a in mixed if a["phase"] == "turn"]
     print(f"\n{len(everything)} answers; {len(mixed)} mixed, of which {placed} reached a landmark and {unplaced} had parted earlier; "
           f"{len(strays)} read like the other side, {len(between)} like neither.")
+    if args.overlay_model:
+        print(f"of the mixed requests for the overlay, {sum(a['via'] == 'name' for a in mixed)} asked by the name "
+              f"{args.overlay_model!r} on the usual path and {sum(a['via'] == 'prefix' for a in mixed)} under {args.prefix}")
     print(f"an answer took {mean(reference)} s on average in the reference and {mean(turned)} s when the side changed before it")
     flips = None
     if gate_before is not None and gate_after is not None:
@@ -335,7 +363,8 @@ def main():
     if args.out:
         with open(args.out, "w") as f:
             json.dump({"server": args.server, "model": args.model, "prefix": args.prefix, "at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                       "passes": args.passes, "min_gap": args.min_gap, "gate": {"before": gate_before, "after": gate_after},
+                       "passes": args.passes, "min_gap": args.min_gap, "overlay_model": args.overlay_model,
+                       "gate": {"before": gate_before, "after": gate_after},
                        "cache": cache, "strays": strays, "between": between, "placed": placed, "unplaced": unplaced,
                        "landmarks": [{"prompt": PROMPTS[i], "marks": marks[i]} for i in marks],
                        "reference": reference, "mixed": mixed}, f, indent=1)
@@ -354,6 +383,10 @@ def main():
         return 1
     if cache and cache["verdict"] == "cleared":
         print("FAIL: a flip cleared the cache. No answer is wrong for that, but each side is meant to keep its own.")
+        return 1
+    if cache and cache["verdict"] == "name apart":
+        print("FAIL: the overlay asked for by name does not share the cache of the overlay under the prefix: two ways in "
+              "that should be one side.")
         return 1
     if flips is not None and flips < in_turn:
         print(f"FAIL: {in_turn} requests each changed the side, and the gate counted only {flips} flips.")
