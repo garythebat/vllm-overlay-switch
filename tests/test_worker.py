@@ -377,5 +377,58 @@ class Flip(WorkerCase):
         self.assertIn("unknown set", out["error"])
 
 
+class DerivedDigest(WorkerCase):
+    """The exact form of "restored": what the model derived from the weights, as one digest per rank."""
+
+    def test_it_can_be_read_before_anything_is_prepared_and_only_by_a_full_look(self):
+        worker = self.worker(0)
+        self.assertNotIn("derived", worker.overlay_status())
+        fresh = worker.overlay_status(True)
+        self.assertEqual((fresh["prepared"], fresh["active"]), (False, None))
+        self.assertRegex(fresh["derived"], r"^[0-9a-f]{16}$")
+        # preparing writes nothing, so the digest is the one the startup left
+        self.assertEqual(worker.overlay_prepare()["derived"], fresh["derived"])
+        self.assertNotIn("derived", worker.overlay_status())
+        self.assertEqual(worker.overlay_status(True)["derived"], fresh["derived"])
+
+    def test_there_and_back_gives_the_digest_of_the_start_on_every_rank(self):
+        seen = set()
+        for rank in range(RANKS):
+            with self.subTest(rank=rank):
+                worker = self.worker(rank)
+                start = worker.overlay_status(True)["derived"]
+                worker.overlay_prepare()
+                over = worker.overlay_switch("overlay")["derived"]
+                self.assertNotEqual(over, start)
+                self.assertEqual(worker.overlay_switch("base")["derived"], start)
+                self.assertEqual(worker.overlay_switch("overlay")["derived"], over)
+                self.assertEqual(worker.overlay_status(True)["derived"], over)
+                seen.add(start)
+        self.assertEqual(len(seen), RANKS)        # each rank holds other columns: digests are per rank
+
+    def test_a_table_left_behind_by_a_flip_would_show(self):
+        worker = self.worker(0)
+        worker.overlay_prepare()
+        start = worker.overlay_status(True)["derived"]
+        for field in ("scale_rows", "scale_mma", "values_tiled"):
+            with self.subTest(field=field):
+                tensor = getattr(worker.layers[SWITCHED[1]]._wo_projection_weights.wo_b, field)
+                flat = tensor.view(torch.uint8)
+                index = tuple(0 for _ in flat.shape)
+                flat[index] ^= 1                           # one bit of one derived table, weights untouched
+                self.assertEqual(worker.overlay_status(True)["active"], "base")
+                self.assertNotEqual(worker.overlay_status(True)["derived"], start)
+                flat[index] ^= 1
+                self.assertEqual(worker.overlay_status(True)["derived"], start)
+
+    def test_a_side_file_that_cannot_be_read_does_not_break_the_status(self):
+        worker = self.worker(0)
+        os.environ[self.w.SIDE_ENV] = os.path.join(self.dir.name, "missing.safetensors")
+        out = worker.overlay_status(True)
+        self.assertEqual((out["ok"], out["prepared"]), (True, False))
+        self.assertNotIn("derived", out)
+        self.assertIn("derived_error", out)
+
+
 if __name__ == "__main__":
     unittest.main()

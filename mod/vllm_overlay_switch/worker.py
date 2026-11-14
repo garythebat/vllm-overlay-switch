@@ -30,6 +30,12 @@ Two things are checked, not assumed:
 Which set is active is read from the live weights, never remembered (the one exception: a
 rank on whose columns the two sets do not differ reports the set it wrote last).
 
+A full status also carries `derived`: one digest per rank of everything the model derived from
+these weights (the packed values, the two scale tables, the tiled copy where there is one).
+It can be read on a freshly started server, before anything was prepared or written. After a
+flip there and back it must be what it was, byte for byte: that is the exact form of "the
+model is restored", and it does not depend on comparing answers.
+
 All copies are done on the bytes (uint8 views), so nothing here depends on which operations
 the installed torch offers for the 8-bit float types.
 
@@ -57,6 +63,7 @@ KINDS = ("weight", "scale")
 PARAM_OF = {"weight": "weight", "scale": "weight_scale_inv"}
 HEADER_DTYPE = {"weight": "F8_E4M3", "scale": "F8_E8M0"}
 MODEL_DTYPE = {"weight": "torch.float8_e4m3fn", "scale": "torch.float8_e8m0fnu"}
+DERIVED = ("values", "scale_rows", "scale_mma", "values_tiled")   # every tensor of the packed wo_b
 
 
 class OverlayWorkerExtension:
@@ -67,6 +74,12 @@ class OverlayWorkerExtension:
         state = getattr(self, "_overlay_switch_state", None)
         out = _answer(self, prepared=state is not None)
         if state is None:
+            if full:  # nothing was read or proven yet, but what the model derived at startup can be fingerprinted
+                try:
+                    layers = sorted({layer for layer, _ in _side_entries(os.environ.get(SIDE_ENV, ""))})
+                    out["derived"] = _derived_digest(self, layers)
+                except Exception as e:
+                    out["derived_error"] = _short(e)
             return out
         try:
             out.update(_report(self, state, full=bool(full)))
@@ -172,9 +185,8 @@ def _base_dir(worker) -> str:
     return snapshot_download(model, revision=getattr(model_config, "revision", None), local_files_only=True)
 
 
-def _prepare(worker) -> dict:
-    """Find the tensors of both sets, check them against the live model, fingerprint both."""
-    side_path = os.environ.get(SIDE_ENV, "")
+def _side_entries(side_path: str) -> dict:
+    """The side file's tensors by (layer, kind), from its header alone. No tensor bytes are read."""
     if not side_path:
         raise RuntimeError(f"{SIDE_ENV} is not set")
     overlay: dict[tuple[int, str], stfile.Entry] = {}
@@ -189,10 +201,19 @@ def _prepare(worker) -> dict:
     layers = sorted({layer for layer, _ in overlay})
     if not layers:
         raise ValueError("the side file holds no tensors")
+    for layer in layers:
+        for kind in KINDS:
+            if (layer, kind) not in overlay:
+                raise ValueError(f"layer {layer}: the side file has no wo_b {kind}")
+    return overlay
+
+
+def _prepare(worker) -> dict:
+    """Find the tensors of both sets, check them against the live model, fingerprint both."""
+    side_path = os.environ.get(SIDE_ENV, "")
+    overlay = _side_entries(side_path)
+    layers = sorted({layer for layer, _ in overlay})
     keys = [(layer, kind) for layer in layers for kind in KINDS]
-    for layer, kind in keys:
-        if (layer, kind) not in overlay:
-            raise ValueError(f"layer {layer}: the side file has no wo_b {kind}")
 
     base_dir = _base_dir(worker)
     with open(os.path.join(base_dir, "model.safetensors.index.json")) as f:
@@ -315,10 +336,40 @@ def _report(worker, state: dict, *, full: bool, wrote: str | None = None) -> dic
     else:
         active = "mixed"
     ok = active in VARIANTS
-    return {"ok": ok, "active": active, "layers": len(state["layers"]), "checked": len(keys), "match": match,
-            "sets": dict(state["ids"]),
-            "error": None if ok else f"the live weights match neither set (base {match['base']}, "
-                                     f"overlay {match['overlay']} of {len(keys)} tensors)"}
+    out = {"ok": ok, "active": active, "layers": len(state["layers"]), "checked": len(keys), "match": match,
+           "sets": dict(state["ids"]),
+           "error": None if ok else f"the live weights match neither set (base {match['base']}, "
+                                    f"overlay {match['overlay']} of {len(keys)} tensors)"}
+    if full:
+        out["derived"] = _derived_digest(worker, state["layers"])
+    return out
+
+
+def _derived_digest(worker, layers) -> str:
+    """One digest of every tensor the model derived from wo_b on this rank, for these layers.
+
+    Shapes and types go in with the bytes, so a table that changed layout cannot pass for one
+    that did not. Each rank holds different columns, so the digest is compared with the same
+    rank's earlier one, never across ranks.
+    """
+    import torch
+
+    attention = _attention_by_layer(worker)
+    whole = hashlib.sha256()
+    for layer in layers:
+        attn = attention.get(layer)
+        packed = getattr(attn, "_wo_projection_weights", None) if attn is not None else None
+        if packed is None:
+            raise ValueError(f"layer {layer}: the output projection is not packed on this rank")
+        for field in DERIVED:
+            tensor = getattr(packed.wo_b, field, None)
+            whole.update(f"{layer}\0{field}\0".encode())
+            if tensor is None:
+                whole.update(b"absent\0")
+                continue
+            whole.update(f"{tuple(tensor.shape)}\0{tensor.dtype}\0".encode())
+            whole.update(memoryview(tensor.contiguous().view(torch.uint8).cpu().numpy()))
+    return whole.hexdigest()[:16]
 
 
 def _write(worker, state: dict, variant: str) -> int:
@@ -372,7 +423,7 @@ def _refresh_derived(attn) -> None:
         block_size=(32, 32),
     ).wo_b
     live = attn._wo_projection_weights.wo_b
-    for field in ("values", "scale_rows", "scale_mma", "values_tiled"):
+    for field in DERIVED:
         old, new = getattr(live, field), getattr(fresh, field)
         if old is None and new is None:
             continue
