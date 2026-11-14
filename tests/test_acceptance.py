@@ -210,6 +210,21 @@ class Tool(unittest.TestCase):
         self.assertIn("at least 4 passes", text)
         self.assertEqual((StandIn.behaviour["salts"], StandIn.behaviour["flips"]), ([], 0))
 
+    def test_a_reading_alone_touches_no_switch(self):
+        import tempfile
+
+        StandIn.behaviour["switch_fails"] = True            # any call to the switch would show
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "reference.json")
+            status, text = self.run_tool("--read-only", "--out", path, "--passes", "4")
+            self.assertEqual(status, 0, text)
+            with open(path) as f:
+                report = json.load(f)
+        self.assertEqual((sorted(report["readings"]), len(report["readings"]["only"]), report["passes"]), (["only"], 4, 4))
+        self.assertEqual((StandIn.behaviour["flips"], StandIn.behaviour["active"]), (0, None))
+        self.assertEqual(len(StandIn.behaviour["salts"]), 4 * len(acceptance.PROMPTS))
+        self.assertEqual(self.run_tool("--read-only")[0], 3)
+
     def test_the_report_file_holds_what_was_read(self):
         import tempfile
 
@@ -280,6 +295,55 @@ class Judge(unittest.TestCase):
         v = acceptance.judge(0, a, b, a)
         self.assertEqual(v["contenders"], ["x", "y"])
         self.assertEqual(v["margins"]["B"], [-4.7, -3.9])
+
+    @staticmethod
+    def two_token_reading(first_margins, second_margins):
+        """One prompt: token "a" with rival "b" at the given margin, then "x" or "y" by the sign of the second margin."""
+        passes = []
+        for m0, m1 in zip(first_margins, second_margins):
+            top0 = [["a", -0.1], ["b", -0.1 - m0]]
+            top1 = sorted((["x", -1.0], ["y", -1.0 - m1]), key=lambda c: -c[1])
+            passes.append([{"prompt": acceptance.PROMPTS[0], "tokens": [
+                {"token": "a", "logprob": -0.1, "top": top0},
+                {"token": top1[0][0], "logprob": top1[0][1], "top": top1}]}])
+        return passes
+
+    def test_a_shared_position_can_tell_the_sets_apart_where_the_parting_cannot(self):
+        # everyone chooses "a" first, but the two sets weigh its rival differently; the next token is a coin toss
+        toss = [0.3, -0.2, 0.4, -0.1]
+        v = acceptance.judge(0, self.two_token_reading([3.0, 3.2, 2.9, 3.4], toss),
+                             self.two_token_reading([0.5, 0.8, 0.2, 0.6], toss),
+                             self.two_token_reading([3.1, 2.8, 3.3, 3.0], toss))
+        self.assertEqual((v["verdict"], v["parts"], v["position"], v["contenders"], v["positions"]), ("clear", True, 0, ["a", "b"], 2))
+        self.assertEqual(v["margins"]["B"], [0.2, 0.5, 0.6, 0.8])
+        self.assertAlmostEqual(v["gap"], 2.0)
+        self.assertIn("at token 0", v["note"])
+
+    def test_identical_answers_can_still_tell_the_sets_apart_by_their_margins(self):
+        same = [2.0, 2.1, 2.2, 2.3]                         # "x" every time: the wording never parts
+        v = acceptance.judge(0, self.two_token_reading([3.0, 3.2, 2.9, 3.4], same),
+                             self.two_token_reading([0.5, 0.8, 0.2, 0.6], same),
+                             self.two_token_reading([3.1, 2.8, 3.3, 3.0], same))
+        self.assertEqual((v["verdict"], v["agree_for"], v["position"]), ("clear", 2, 0))
+        flat = acceptance.judge(0, self.two_token_reading(same, same), self.two_token_reading(same, same),
+                                self.two_token_reading(same, same))
+        self.assertEqual((flat["verdict"], flat["parts"]), ("same", False))
+
+    def test_the_return_is_judged_where_the_answers_part_and_nowhere_else(self):
+        # at token 0 A after stands apart from A before, but nobody parts there: that alone is not "not restored"
+        toss = [0.3, -0.2, 0.4, -0.1]
+        v = acceptance.judge(0, self.two_token_reading([3.0, 3.2, 2.9, 3.4], toss),
+                             self.two_token_reading([3.1, 3.0, 3.3, 2.8], toss),
+                             self.two_token_reading([6.0, 6.2, 6.1, 6.4], toss))
+        self.assertEqual((v["a_moved"], v["verdict"]), (False, "noise"))
+
+    def test_the_rival_is_the_token_the_answers_give_most_weight_to(self):
+        def one(top):
+            return [[{"prompt": acceptance.PROMPTS[0], "tokens": [{"token": "a", "logprob": top[0][1], "top": top}]}]]
+        a = one([["a", -0.1], ["b", -3.0], ["c", -6.0]]) + one([["a", -0.1], ["c", -5.0], ["b", -3.5]])
+        b = one([["a", -0.2], ["b", -2.0], ["c", -7.0]]) + one([["a", -0.2], ["b", -2.2]])
+        v = acceptance.judge(0, a, b, a)
+        self.assertEqual((v["contenders"], v["agree_for"], v["positions"]), (["a", "b"], 1, 1))
 
     def test_chance(self):
         self.assertEqual(round(1 / acceptance.chance_apart(6, 6)), 462)

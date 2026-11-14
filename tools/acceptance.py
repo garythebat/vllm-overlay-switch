@@ -7,11 +7,12 @@ Does the model read what a flip wrote?
     Two models with different weights weigh the next token differently at some point where
     both have read exactly the same words. The live set (A) is read several times, then the
     other set (B) after a flip, then A again after flipping back. For each prompt the answers
-    are walked token by token while they all agree; at the first place they part, every
-    answer was produced from an identical context. The two tokens most often chosen there
-    are the contenders, and each answer's margin is the log probability of the first minus
-    that of the second. A prompt tells the sets apart when every A margin lies on one side
-    and every B margin on the other.
+    are walked token by token while they all agree. At every position up to and including
+    the first place they part, every answer was produced from an identical context. At each
+    such position the contenders are the token chosen most often and its strongest rival, and
+    an answer's margin is the log probability of the first minus that of the second. A
+    position tells the sets apart when every A margin lies on one side and every B margin on
+    the other; a prompt does when one of its positions does.
 
 Does flipping back restore the model?
     Exactly, when the switch offers it: a full status carries one digest per rank of every
@@ -31,6 +32,7 @@ Run it where the switch accepts calls from (by default: on the machine the serve
 
     python3 tools/acceptance.py http://127.0.0.1:8000 MODEL_NAME
     python3 tools/acceptance.py http://127.0.0.1:8000 MODEL_NAME --passes 8 --out report.json
+    python3 tools/acceptance.py http://127.0.0.1:8000 OTHER_MODEL --read-only --out reference.json
 
 Exit status: 0 the flip is shown and the return restores; 1 it is shown not to work;
 2 these prompts cannot tell the two sets apart (not proof of anything); 3 could not run.
@@ -147,38 +149,80 @@ def chance_apart(m, n):
     return 2 / math.comb(m + n, n)
 
 
+def margins_at(runs, n):
+    """The contenders at position n and each answer's margin between them, by side.
+
+    The first contender is the token chosen most often there; its rival is the other token the
+    answers give the most probability to, taken over all of them. A token outside an answer's
+    returned list is at most as likely as the list's last entry: using that bound can only pull
+    margins together.
+    """
+    chosen = collections.Counter(r["tokens"][n]["token"] for _, r in runs).most_common()
+    first = chosen[0][0]
+    weight = collections.Counter()
+    tops = []
+    for _, r in runs:
+        top = dict((token, logprob) for token, logprob in r["tokens"][n]["top"])
+        top.setdefault(r["tokens"][n]["token"], r["tokens"][n]["logprob"])
+        tops.append(top)
+        for token, logprob in top.items():
+            if token != first:
+                weight[token] += math.exp(logprob)
+    if not weight:
+        return None
+    second = max(sorted(weight), key=weight.get)
+    margins, picks = {side: [] for side in SIDES}, {side: [] for side in SIDES}
+    for (side, r), top in zip(runs, tops):
+        floor = min(top.values())
+        margins[side].append(round(top.get(first, floor) - top.get(second, floor), 3))
+        picks[side].append(r["tokens"][n]["token"])
+    return {"position": n, "contenders": [first, second], "margins": {side: sorted(v) for side, v in margins.items()},
+            "chosen": picks}
+
+
+def gap(x, y):
+    """The distance between two groups that do not overlap, else 0."""
+    return max(min(x) - max(y), min(y) - max(x), 0) if x and y else 0
+
+
 def judge(index, a1, b, a2):
-    """One prompt: where the answers first part, and what the margins there show."""
+    """One prompt: every position at which all answers had read the same words, and what the margins there show."""
     runs = [("A before", r[index]) for r in a1] + [("B", r[index]) for r in b] + [("A after", r[index]) for r in a2]
     tokens = [[t["token"] for t in r["tokens"]] for _, r in runs]
     n = 0
     while all(len(t) > n for t in tokens) and len({t[n] for t in tokens}) == 1:
         n += 1
-    out = {"prompt": PROMPTS[index], "agree_for": n, "shared": "".join(tokens[0][:n]), "parts": False, "a_moved": False}
-    if not all(len(t) > n for t in tokens):
-        if len({len(t) for t in tokens}) == 1:
-            return {**out, "verdict": "same", "note": "all answers are identical: this prompt does not tell the sets apart"}
-        return {**out, "verdict": "unclear", "note": "some answers end where others go on"}
-    chosen = collections.Counter(t[n] for t in tokens).most_common()
-    first, second = chosen[0][0], chosen[1][0]
-    margins, picks = {side: [] for side in SIDES}, {side: [] for side in SIDES}
-    for side, r in runs:
-        top = dict((token, logprob) for token, logprob in r["tokens"][n]["top"])
-        top.setdefault(r["tokens"][n]["token"], r["tokens"][n]["logprob"])
-        floor = min(top.values())           # a token outside the list is at most this likely: margins can only shrink
-        margins[side].append(round(top.get(first, floor) - top.get(second, floor), 3))
-        picks[side].append(r["tokens"][n]["token"])
-    out.update(contenders=[first, second], margins={side: sorted(v) for side, v in margins.items()}, chosen=picks)
-    both_a = margins["A before"] + margins["A after"]
-    out["parts"] = apart(both_a, margins["B"])
-    out["a_moved"] = apart(margins["A before"], margins["A after"])
+    parted = all(len(t) > n for t in tokens)            # false when some answer simply ends at n
+    out = {"prompt": PROMPTS[index], "agree_for": n, "shared": "".join(tokens[0][:n]), "parts": False, "a_moved": False,
+           "positions": 0}
+    best, at_parting = None, None
+    for position in range(n + 1 if parted else n):
+        seen = margins_at(runs, position)
+        if seen is None:
+            continue
+        out["positions"] += 1
+        seen["gap"] = gap(seen["margins"]["A before"] + seen["margins"]["A after"], seen["margins"]["B"])
+        if position == n:
+            at_parting = seen
+        if best is None or seen["gap"] > best["gap"]:
+            best = seen
+    shown = best if best and best["gap"] > 0 else (at_parting or best)
+    if shown:
+        out.update(shown)
+    out["parts"] = bool(best and best["gap"] > 0)
+    out["a_moved"] = bool(at_parting and apart(at_parting["margins"]["A before"], at_parting["margins"]["A after"]))
     if out["a_moved"]:
-        return {**out, "verdict": "not restored", "note": "A after the return stands apart from A before"}
+        return {**out, "verdict": "not restored", "note": "where the answers part, A after the return stands apart from A before"}
     if out["parts"]:
-        return {**out, "verdict": "clear", "note": "every A margin on one side, every B margin on the other; A after sits with A before"}
-    if apart(margins["A before"], margins["B"]):
+        return {**out, "verdict": "clear", "note": f"at token {best['position']} every A margin lies on one side and every B "
+                                                    f"margin on the other, {round(best['gap'], 3)} apart"}
+    if not parted:
+        if len({len(t) for t in tokens}) == 1:
+            return {**out, "verdict": "same", "note": "all answers are identical and no margin tells the sets apart"}
+        return {**out, "verdict": "unclear", "note": "some answers end where others go on"}
+    if apart(at_parting["margins"]["A before"], at_parting["margins"]["B"]):
         return {**out, "verdict": "unclear", "note": "A before stands apart from B, but A after the return does not"}
-    return {**out, "verdict": "noise", "note": "the margins of A and B overlap: this prompt does not tell the sets apart"}
+    return {**out, "verdict": "noise", "note": "the margins of A and B overlap at every shared position"}
 
 
 def main():
@@ -199,6 +243,9 @@ def main():
     parser.add_argument("--expect-parting", action="store_true",
                         help="the two sets are known to part on these prompts when served separately: "
                              "treat no parting at all as a failure, not as 'cannot tell'")
+    parser.add_argument("--read-only", action="store_true",
+                        help="only read the served model and save the answers (needs --out): no status call, no flip. "
+                             "For a reference reading, e.g. of the overlay loaded as a model of its own")
     parser.add_argument("--out", help="write everything that was read to this JSON file")
     args = parser.parse_args()
     args.server = args.server.rstrip("/")
@@ -213,6 +260,16 @@ def main():
     served = [m.get("id") for m in models.get("data", [])] if code == 200 else []
     if args.model not in served:
         raise CouldNotRun(f"{args.server} serves {served}, not {args.model!r}: nothing asked")
+
+    if args.read_only:
+        if not args.out:
+            raise CouldNotRun("--read-only needs --out: the reading is all it produces")
+        only = reading(args, f"{args.model} as served", "only")
+        with open(args.out, "w") as f:
+            json.dump({"server": args.server, "model": args.model, "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                       "passes": args.passes, "cache_salt": not args.no_cache_salt, "readings": {"only": only}}, f, indent=1)
+        print(f"saved {args.out}: {args.passes} passes of {len(PROMPTS)} prompts, nothing flipped")
+        return 0
 
     start = status(args, full=True)        # on a fresh server this is what the startup derived, before anything was read
     at_start = derived(start)
@@ -238,7 +295,7 @@ def main():
     for v in verdicts:
         print(f"\n{v['prompt'][:70]!r}\n  all answers agree for {v['agree_for']} tokens: {v['shared'][:80]!r}")
         if "margins" in v:
-            print(f"  margin of {v['contenders'][0]!r} over {v['contenders'][1]!r}:")
+            print(f"  at token {v['position']}, margin of {v['contenders'][0]!r} over {v['contenders'][1]!r}:")
             for side in SIDES:
                 picks = dict(collections.Counter(v["chosen"][side]))
                 print(f"    {side:9} {v['margins'][side]}  chose {picks}")
@@ -246,7 +303,11 @@ def main():
     count = {k: sum(1 for v in verdicts if v["verdict"] == k) for k in ("clear", "not restored", "noise", "same", "unclear")}
     parts = sum(1 for v in verdicts if v["parts"])
     moved = sum(1 for v in verdicts if v["a_moved"])
-    print(f"\n{count}; told apart on {parts} prompts")
+    looked = sum(v["positions"] for v in verdicts)
+    one_in = math.comb(3 * args.passes, args.passes) / 2
+    print(f"\n{count}; told apart on {parts} prompts. {looked} positions were looked at; on one set a position tells "
+          f"'apart' by chance one time in {round(one_in)}, so about one run in {max(1, round(one_in / max(looked, 1)))} "
+          f"shows a single stray one")
 
     exact = None
     if at_start and at_end:

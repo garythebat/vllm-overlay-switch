@@ -190,12 +190,15 @@ next token differently at some point where both have read exactly the same words
 1. Read the live set (A) several times: a handful of plain prompts at temperature 0 with
    thinking off, recording the tokens and their alternatives. Flip, read the other set
    (B). Flip back, read A again.
-2. For each prompt, walk the answers token by token while they all agree. At the first
-   place they part, every answer was produced from an identical context. The two tokens
-   most often chosen there are the contenders; an answer's margin is the log probability
-   of the first minus that of the second.
-3. A prompt tells the sets apart when every A margin, before and after, lies on one side
-   and every B margin on the other.
+2. For each prompt, walk the answers token by token while they all agree. At every
+   position up to and including the first place they part, every answer was produced
+   from an identical context. At each such position the contenders are the token chosen
+   most often and the rival the answers give most weight to; an answer's margin is the
+   log probability of the first minus that of the second.
+3. A position tells the sets apart when every A margin, before and after, lies on one
+   side and every B margin on the other. A prompt does when one of its positions does.
+   Looking only at the parting was not enough: the two sets often choose the same word
+   while weighing its rival very differently, and that is the steadier signal.
 
 **Does flipping back restore the model?** Exactly: the `derived` digest of every rank
 is read when the test begins and again when it ends, and must be equal. The weights
@@ -211,7 +214,12 @@ chance one time in three, and the test reported a failed return that was not one
 each set is read six times by default, each request carries its own `cache_salt` so
 that no answer reuses another's cached prefix, and the judgement is on whether two
 groups of margins overlap at all. Two groups of six from one source do not overlap by
-chance one time in 462; twelve against six, one time in about nine thousand.
+chance one time in 462; twelve against six, one time in about nine thousand, and the
+test says how many positions it looked at so that the figure can be read against that.
+
+`--read-only` reads a server without touching any switch and saves the answers: a
+reference, for instance of the overlay loaded as a model of its own, to set beside the
+flipped state.
 
 ## Open questions, to be settled by running it
 
