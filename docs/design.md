@@ -42,15 +42,15 @@ the overlay's, and back, with a single call.
    result is kept in `self._wo_projection_weights`. For 32x32 scales nothing is
    requantized: the packed `values` are `weight.contiguous()`, the Parameter's own
    memory, and two scale tables (`scale_rows`, `scale_mma`) are new memory derived
-   from the block scales. For two specific shapes, one of them 4096 x 4096, there is
-   also `values_tiled`, a second, tiled copy of the values
+   from the block scales. For two specific shapes there is also `values_tiled`, a
+   second, tiled copy of the values
    (`flashinfer/experimental/b12x/gemm/_shared/wo_mxfp8.py:1447-1544`), which the decode
    kernel reads when its plan asks for it
-   (`flashinfer/experimental/b12x/gemm/wo_projection/_preparation.py:503-504`). A file
-   weight of 4096 x 10240 reads as ten groups of rank 1024; padded to twelve groups over
-   three ranks, each rank's `wo_b` would be exactly that shape. This is worked out from
-   sizes, not yet read from a running model. `wo_a` and `wo_b` are packed by two
-   separate calls (`wo_mxfp8.py:1547-1585`), so `wo_b` can be handled alone.
+   (`flashinfer/experimental/b12x/gemm/wo_projection/_preparation.py:503-504`). Whether
+   a deployment has it depends on the shape each rank holds, so the switch assumes
+   neither: it refreshes every derived tensor the packing function returns and refuses
+   if one changed shape. `wo_a` and `wo_b` are packed by two separate calls
+   (`wo_mxfp8.py:1547-1585`), so `wo_b` can be handled alone.
 
 6. **The forward pass binds the packed object on every call**
    (`attention.py:1754-1767`). The prepared plan holds scratch space for activations,
@@ -163,15 +163,18 @@ state is still the previous set. What the engine does with late answers was not 
 
 ## Memory and time
 
-For the motivating case, if each rank's `wo_b` is 4096 x 4096 as worked out above, a rank
-writes 26 weights of 16.8 MB (437 MB in all) and 26 small scale tensors. Nothing is kept
-between flips. During a flip one file tensor (42 MB) and one cut (16.8 MB) are held on
-the CPU side, and the packing function allocates a few tens of megabytes on the device,
-which are released at the end. Preparing reads both sets once, about 2.2 GB of file
-reads per rank.
+For the motivating case the side file holds 26 weights of 5120 x 8192 (42 MB each, as
+its header says) with their 160 x 256 block scales. A rank writes its own columns of
+each; how many columns that is depends on the number of ranks and is read from the live
+model. Nothing is kept between flips. During a flip one file tensor and this rank's cut
+of it are held on the CPU side, and the packing function allocates scratch on the
+device, which is released at the end. A flip reads every file tensor whole, about
+1.1 GB per rank; preparing reads both sets once, about 2.2 GB.
 
-These sizes are worked out from the file and the shapes in the source, not measured.
-Flip time has not been measured either.
+The file's sizes are read from the file. What a rank writes, the scratch the packing
+needs and the time a flip takes have not been measured yet. An earlier version of this
+section gave per-rank sizes worked out from an assumed shape; they were wrong and are
+gone.
 
 ## Acceptance test
 
