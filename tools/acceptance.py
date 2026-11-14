@@ -1,41 +1,43 @@
 #!/usr/bin/env python3
-"""Acceptance test for the overlay switch, against a running server. Standard library only.
+"""Acceptance test for the overlay switch, run against a live server. Standard library only.
 
-It asks nothing sensitive and needs no reference answers. It answers two questions.
+It sends no sensitive prompts and needs no reference outputs. It checks two things.
 
-Does the model read what a flip wrote?
-    Two models with different weights weigh the next token differently at some point where
-    both have read exactly the same words. The live set (A) is read several times, then the
-    other set (B) after a flip, then A again after flipping back. For each prompt the answers
-    are walked token by token while they all agree. At every position up to and including
-    the first place they part, every answer was produced from an identical context. At each
-    such position the contenders are the token chosen most often and its strongest rival, and
-    an answer's margin is the log probability of the first minus that of the second. A
-    position tells the sets apart when every A margin lies on one side and every B margin on
-    the other; a prompt does when one of its positions does.
+1. The model uses the weights a switch wrote.
+    Two models with different weights assign different probabilities to the next token at
+    some position where both have seen exactly the same text. The active variant (A) is
+    sampled several times, then the other variant (B) after a switch, then A again after
+    switching back. For each prompt the responses are compared token by token while they all
+    agree. At every position up to and including the first divergence, every response was
+    produced from an identical context. At each such position the two candidates are the
+    token chosen most often and its strongest rival, and a response's margin is the log
+    probability of the first minus that of the second. A position distinguishes the variants
+    when every A margin lies on one side and every B margin on the other; a prompt does when
+    one of its positions does.
 
-Does flipping back restore the model?
-    Exactly, when the switch offers it: a full status carries one digest per rank of every
+2. Switching back restores the model.
+    Exactly, when the plugin supports it: a full status includes one digest per rank of every
     tensor the model derived from the switched weights. It is read when the test begins and
     when it ends, and the two must be equal on every rank. The weights themselves are read
-    back by the switch after every flip. Without that digest the answers have to do: A after
-    the return must not stand apart from A before.
+    back by the plugin after every switch. Without that digest the outputs have to serve: A
+    after the return must not be distinguishable from A before.
 
-Why margins and several passes. The same request does not return the same numbers twice on
-every deployment: kernels are chosen by timing, prefixes are cached, speculative tokens are
-verified in batches. On the first hardware this ran on, identical requests moved a margin by
-one to three logits. Two passes cannot tell that from a change of weights; five or more can.
-Each request carries its own cache salt, so no answer reuses another's cached prefix and the
+Why margins and several passes: the same request does not return the same logits twice on
+every deployment (kernels are selected by timing, prefixes are cached, speculative tokens are
+verified in batches). On the test hardware, identical requests moved a margin by one to three
+logits. Two passes cannot tell that apart from a change of weights; five or more can. Each
+request carries its own cache salt, so no response reuses another's cached prefix and the
 passes are independent.
 
-Run it where the switch accepts calls from (by default: on the machine the server runs on).
+Run it from an address the switch routes accept (by default: on the server's own host).
 
     python3 tools/acceptance.py http://127.0.0.1:8000 MODEL_NAME
     python3 tools/acceptance.py http://127.0.0.1:8000 MODEL_NAME --passes 8 --out report.json
     python3 tools/acceptance.py http://127.0.0.1:8000 OTHER_MODEL --read-only --out reference.json
 
-Exit status: 0 the flip is shown and the return restores; 1 it is shown not to work;
-2 these prompts cannot tell the two sets apart (not proof of anything); 3 could not run.
+Exit status: 0 the switch is shown to work and switching back restores the model; 1 it is shown
+not to work; 2 inconclusive: these prompts do not distinguish the two variants (proof of
+nothing); 3 the test could not run.
 """
 
 import argparse
@@ -242,27 +244,25 @@ def judge(index, a1, b, a2):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Acceptance test for the overlay switch (see the top of this file).")
+    parser = argparse.ArgumentParser(description="Acceptance test for the overlay switch (see the docstring at the top of this file).")
     parser.add_argument("server", help="base URL of the OpenAI-compatible server, e.g. http://127.0.0.1:8000")
-    parser.add_argument("model", help="the served model name")
-    parser.add_argument("--switch", help="base URL of the switch routes if not the same as the server")
-    parser.add_argument("--api-key", help="API key of the server, if it has one")
-    parser.add_argument("--token", help="X-Overlay-Token, if the switch asks for one")
-    parser.add_argument("--passes", type=int, default=6, help=f"readings of each set (default 6, at least {MIN_PASSES})")
+    parser.add_argument("model", help="served model name")
+    parser.add_argument("--switch", help="base URL of the switch routes, if different from the server")
+    parser.add_argument("--api-key", help="the server's API key, if it has one")
+    parser.add_argument("--token", help="X-Overlay-Token, if the switch routes require one")
+    parser.add_argument("--passes", type=int, default=6, help=f"samples of each variant (default 6, at least {MIN_PASSES})")
     parser.add_argument("--max-tokens", type=int, default=24)
-    parser.add_argument("--top", type=int, default=20, help="how many alternatives to ask for per token (default 20)")
-    parser.add_argument("--need", type=int, default=2, help="how many prompts must tell the sets apart (default 2)")
+    parser.add_argument("--top", type=int, default=20, help="number of alternatives to request per token (default 20)")
+    parser.add_argument("--need", type=int, default=2, help="number of prompts that must distinguish the variants (default 2)")
     parser.add_argument("--thinking-kwarg", default="enable_thinking",
-                        help="chat template switch to turn thinking off; empty to send none")
+                        help="chat template argument that turns thinking off; empty to send none")
     parser.add_argument("--no-cache-salt", action="store_true",
                         help="send no cache_salt (for a server that rejects the field); passes then share cached prefixes")
     parser.add_argument("--expect-parting", action="store_true",
-                        help="the two sets are known to part on these prompts when served separately: "
-                             "treat no parting at all as a failure, not as 'cannot tell'")
+                        help="the two variants are known to differ on these prompts when served separately: treat no difference at all as a failure instead of an inconclusive result")
     parser.add_argument("--read-only", action="store_true",
-                        help="only read the served model and save the answers (needs --out): no status call, no flip. "
-                             "For a reference reading, e.g. of the overlay loaded as a model of its own")
-    parser.add_argument("--out", help="write everything that was read to this JSON file")
+                        help="only sample the served model and save the responses (needs --out): no status call, no switch. Use it for a reference, for example of the overlay loaded as a model of its own")
+    parser.add_argument("--out", help="write all samples and results to this JSON file")
     args = parser.parse_args()
     args.server = args.server.rstrip("/")
     args.switch = (args.switch or args.server).rstrip("/")

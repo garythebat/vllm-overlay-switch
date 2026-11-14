@@ -1,60 +1,61 @@
 #!/usr/bin/env python3
-"""Acceptance test for the gate: one server answering on two sets of paths. Standard library only.
+"""Acceptance test for the gate: one server serving two variants on two sets of paths. Standard library only.
 
-The gate lets the base set answer on the usual paths and the overlay under a prefix, flipping
-when a request arrives for the other side. Four questions, three of them answered exactly.
+The gate serves the base variant on the standard paths and the overlay under a prefix, and
+switches when a request arrives for the other variant. The test runs four checks. Three are
+exact, one is statistical.
 
-Is every answer marked with the side it was asked on?  (exact)
-    The gate puts `x-overlay-side` on every answer of a request that ran the model.
+1. Every response carries the header of the variant it requested.  (exact)
+    The gate sets `x-overlay-side` on every response to a request that ran the model.
 
-Is a request ever answered by the other side's weights?  (by the answers)
-    Reference: the usual endpoint is read several times, then the prefixed one, every request
-    under a cache salt of its own. For each prompt the reference answers are walked token by
-    token while they all agree. At every such position the margin between the most chosen
-    token and its strongest rival is taken, by side. A position is a landmark when the two
-    sides stand apart there by a clear distance (--min-gap): from then on it tells which
-    weights produced an answer. Mixed: the prompts that have a landmark are asked on both
-    endpoints in turn, so that the server flips before every single request, and then in
-    bursts of both at once. Each mixed answer is laid against every landmark it reaches. On
-    its own side of the middle between the two reference groups it lies with its side. As
-    far over as the other side's reference answers, it was answered by the other side's
-    weights: one such answer fails the test and is shown. In the stretch between (past the
-    middle, short of the other group) it reads like neither, and the test then says it
-    cannot tell: run it again.
-
-    Where that rule comes from. The same request does not return the same numbers twice on
-    every deployment; on the first hardware this ran on, a margin moved by one to four logits
-    between identical requests. Readings from that hardware in which nothing was mixed were
-    replayed through this rule at the default gap: of 738 answers none lay with the other
-    group and 2 lay in the stretch between. Then with the labels swapped on purpose: of 216
-    answers 185 lay with the other group, 31 in the stretch between, none on the side of
-    their label. So an answer between is far likelier a wrong one than a right one, and is
-    not passed.
-
-Do the two sides keep their cached prefixes apart, and does a flip leave them alone?  (exact)
-    One long prompt is sent under the same client salt on both endpoints, and the server's own
+2. The two variants keep separate prefix caches, and a switch clears neither.  (exact)
+    One long prompt is sent with the same client salt to both endpoints, and the server's own
     counters on /metrics are read around each request: base (nothing reused), base again
-    (reused), overlay (nothing reused: the sides do not share), overlay again (reused), base
-    once more (reused: two flips later its cache is still there).
+    (reused), overlay (nothing reused: the variants do not share), overlay again (reused), base
+    once more (reused: two switches later its cache is still there).
 
-Did the server flip as often as the side changed?  (exact, with --status)
-    The gate counts its flips. The count is read before and after the requests asked in turn.
+3. The server switched as often as the variant changed.  (exact, with --status)
+    The gate counts its switches. The count is read before and after the alternating requests.
 
-With --overlay-model NAME the overlay is also asked for by name on the usual paths (a server
-started with OVERLAY_GATE_MODELS): every other mixed request for the overlay goes that way, and
-the cache check asks once by name for what was cached under the prefix. The same four questions
-then cover both ways in.
+4. No request is served with the other variant's weights.  (statistical, from the outputs)
+    Reference: the standard endpoint is sampled several times, then the prefixed one, every
+    request with its own cache salt. For each prompt the reference responses are compared token
+    by token while they all agree. At every such position the margin between the token chosen
+    most often and its strongest rival is recorded per variant. A position becomes a reference
+    position (a "landmark" in the output) when the two variants differ there by a clear
+    distance (--min-gap): from then on it identifies which weights produced a response. Mixed
+    phase: the prompts that have a reference position are sent to both endpoints alternately,
+    so that the server switches before every single request, and then in concurrent bursts to
+    both. Each mixed response is compared at every reference position it reaches. On its own
+    side of the midpoint between the two reference groups, it matches its variant. As far over
+    as the other variant's reference responses, it was produced with the other variant's
+    weights: one such response fails the test and is printed. Between the two (past the
+    midpoint, short of the other group) it matches neither, and the result is inconclusive
+    ("cannot tell" in the output): run the test again.
 
-With --effort-check (a server started with OVERLAY_GATE_EFFORT_KEEP) a fifth question, exact:
-is every reasoning_effort a client with its own ladder may send answered, on every way in and
-in both places a request can carry it? The words medium, minimal, ultra and a made-up one, and
-the integers 50, 0 and 101, must each come back 200, and the model list must say what the
+    How that rule was calibrated. The same request does not return the same logits twice on
+    every deployment; on the test hardware a margin moved by one to four logits between
+    identical requests. Unmixed samples from that hardware were replayed through this rule at
+    the default gap: of 738 responses none fell with the other group and 2 fell in between.
+    Then with the labels swapped on purpose: of 216 responses 185 fell with the other group, 31
+    in between, and none on the side of its label. A response in between is therefore far more
+    likely to be wrong than right, and does not pass.
+
+With --overlay-model NAME the overlay is also requested by model name on the standard paths (a
+server started with OVERLAY_GATE_MODELS): every second mixed request for the overlay is sent
+that way, and the cache check sends one request by name for what was cached under the prefix.
+The same four checks then cover both ways of selecting the overlay.
+
+With --effort-check (a server started with OVERLAY_GATE_EFFORT_KEEP) there is a fifth, exact
+check: every reasoning_effort value a seven-level client may send is accepted, on every path and
+in both places a request can carry it. The words medium, minimal, ultra and an unknown one, and
+the integers 50, 0 and 101, must each return 200, and the model list must advertise what the
 model accepts.
 
     python3 tools/gate_acceptance.py http://HOST:8000 MODEL_NAME --prefix /free --out report.json
 
-Exit status: 0 passed; 1 shown not to work; 2 cannot tell (too few landmarks, or the cache
-counters could not be read cleanly); 3 could not run.
+Exit status: 0 passed; 1 shown not to work; 2 inconclusive (too few reference positions, or the
+cache counters could not be read cleanly); 3 the test could not run.
 """
 
 import argparse
@@ -278,31 +279,30 @@ def effort_check(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Acceptance test for the overlay gate (see the top of this file).")
+    parser = argparse.ArgumentParser(description="Acceptance test for the overlay gate (see the docstring at the top of this file).")
     parser.add_argument("server", help="base URL of the server, e.g. http://127.0.0.1:8000")
-    parser.add_argument("model", help="the served model name")
-    parser.add_argument("--prefix", default="/free", help="the path prefix under which the overlay answers (default /free)")
-    parser.add_argument("--overlay-model", help="a model name that chooses the overlay on the usual paths; it is then asked "
-                                                "for that way too")
-    parser.add_argument("--api-key", help="API key of the server, if it has one")
-    parser.add_argument("--passes", type=int, default=6, help="reference readings of each endpoint (default 6)")
-    parser.add_argument("--mixed", type=int, default=6, help="rounds asked in turn, a flip before every request (default 6)")
-    parser.add_argument("--burst", type=int, default=2, help="bursts of both sides at once (default 2)")
-    parser.add_argument("--copies", type=int, default=2, help="how often each prompt is asked per side within one burst (default 2)")
+    parser.add_argument("model", help="served model name")
+    parser.add_argument("--prefix", default="/free", help="path prefix that serves the overlay (default /free)")
+    parser.add_argument("--overlay-model", help="model name that selects the overlay on the standard paths; the overlay is then also requested by this name")
+    parser.add_argument("--api-key", help="the server's API key, if it has one")
+    parser.add_argument("--passes", type=int, default=6, help="reference samples of each endpoint (default 6)")
+    parser.add_argument("--mixed", type=int, default=6, help="alternating rounds, with a switch before every request (default 6)")
+    parser.add_argument("--burst", type=int, default=2, help="concurrent bursts to both endpoints (default 2)")
+    parser.add_argument("--copies", type=int, default=2, help="requests per prompt and variant within one burst (default 2)")
     parser.add_argument("--min-gap", type=float, default=3.0,
-                        help="how far apart the reference groups must stand at a landmark, in logits (default 3)")
-    parser.add_argument("--need", type=int, default=2, help="prompts that must have a landmark (default 2)")
+                        help="minimum distance between the reference groups at a reference position, in logits (default 3)")
+    parser.add_argument("--need", type=int, default=2, help="number of prompts that must have a reference position (default 2)")
     parser.add_argument("--max-tokens", type=int, default=24)
     parser.add_argument("--top", type=int, default=20)
     parser.add_argument("--thinking-kwarg", default="enable_thinking")
     parser.add_argument("--effort-check", action="store_true",
-                        help="also send every reasoning_effort of a seven-step client; each must be answered 200")
-    parser.add_argument("--no-cache-check", action="store_true", help="leave the cache counters out (a server without /metrics)")
+                        help="also send every reasoning_effort value of a seven-level client; each must return 200")
+    parser.add_argument("--no-cache-check", action="store_true", help="skip the cache check (for a server without /metrics)")
     parser.add_argument("--cache-attempts", type=int, default=3)
     parser.add_argument("--counter-wait", type=float, default=5.0, help="seconds to wait for the counters after a request")
-    parser.add_argument("--status", help="base URL on which GET /overlay/status answers from here (for the gate's own flip count)")
-    parser.add_argument("--token", help="X-Overlay-Token, if the status route asks for one")
-    parser.add_argument("--out", help="write everything that was read to this JSON file")
+    parser.add_argument("--status", help="base URL where GET /overlay/status is reachable from here (for the gate's own switch count)")
+    parser.add_argument("--token", help="X-Overlay-Token, if the status route requires one")
+    parser.add_argument("--out", help="write all samples and results to this JSON file")
     args = parser.parse_args()
     args.server, args.prefix = args.server.rstrip("/"), "/" + args.prefix.strip("/")
     args.nonce = secrets.token_hex(4)
