@@ -368,7 +368,9 @@ def _derived_digest(worker, layers) -> str:
                 whole.update(b"absent\0")
                 continue
             whole.update(f"{tuple(tensor.shape)}\0{tensor.dtype}\0".encode())
-            whole.update(memoryview(tensor.contiguous().view(torch.uint8).cpu().numpy()))
+            # bytes first, then the copy: a strided table is gathered as uint8, so this needs no copy
+            # kernel for the 8-bit float types on the device
+            whole.update(memoryview(tensor.view(torch.uint8).contiguous().cpu().numpy()))
     return whole.hexdigest()[:16]
 
 
