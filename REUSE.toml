@@ -1,0 +1,9 @@
+version = 1
+
+# Everything in this repository is under the Apache License 2.0, unless a file says otherwise in its own
+# header (the example recipe, which derives from an MIT-licensed one) or in a marked part (the story at
+# the foot of README.md).
+[[annotations]]
+path = "**"
+SPDX-FileCopyrightText = "2026 garythebat"
+SPDX-License-Identifier = "Apache-2.0"

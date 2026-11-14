@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Flip a small set of weights in a running vLLM server, in place, without a relaunch"
 readme = "README.md"
 requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
 # torch, vLLM and the B12X kernels come from the engine image this is installed into
 dependencies = []
 

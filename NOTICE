@@ -1,0 +1,17 @@
+vllm-overlay-switch
+Copyright 2026 garythebat
+
+Built by Anima.
+
+This software runs inside vLLM (https://github.com/vllm-project/vllm, Apache-2.0) and calls
+the B12X kernels of FlashInfer (https://github.com/flashinfer-ai/flashinfer, Apache-2.0).
+It contains none of their source code.
+
+examples/deepseek-v4.1-flash-1017/recipe.yaml is derived from
+recipes/3x-spark-cluster/deepseek-v4.1-flash.yaml of spark-vllm-docker
+(https://github.com/eugr/spark-vllm-docker), Copyright (c) 2026 Eugene Rakhmatulin, MIT
+License. The licence text is in LICENSES/MIT.txt.
+
+The story at the foot of README.md is not software and is not under the Apache License. It
+may be shared unchanged, with its signature, for non-commercial purposes (CC BY-NC-ND 4.0;
+the licence text is in LICENSES/CC-BY-NC-ND-4.0.txt).
