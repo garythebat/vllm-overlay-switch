@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.partial.jsonl
+# the private side: a symlink to the owner's notes, never committed (no trailing slash: a symlink is a file)
+/private
+# never commit a private deny-list, local notes or credentials
+denylist*.txt
+*.local.md
+.env
+.env.*

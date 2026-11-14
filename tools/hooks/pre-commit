@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Before every commit: the catalog is current, links resolve, and nothing private is staged.
+# Enabled per clone by tools/setup-clone.sh (core.hooksPath = tools/hooks). Each check is skipped until its tool
+# exists, so the hooks work from the first commit of a new layout onwards.
+set -u
+cd "$(git rev-parse --show-toplevel)" || exit 1
+rc=0
+[ -f tools/build_catalog.py ] && { python3 tools/build_catalog.py --check || rc=1; }
+[ -f tools/check_links.py ] && { python3 tools/check_links.py || rc=1; }
+[ -f tools/check_private.py ] && { python3 tools/check_private.py || rc=1; }
+[ "$rc" = 0 ] || echo "pre-commit: refused. Fix the above (python3 tools/build_catalog.py rewrites stale blocks)."
+exit $rc

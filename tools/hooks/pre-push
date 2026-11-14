@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Everything that must be true before anything leaves this machine. Any failure stops the push.
+set -u
+cd "$(git rev-parse --show-toplevel)" || exit 1
+export PRIVATE_DENYLIST="${PRIVATE_DENYLIST:-$(git config --get privacy.denylist 2>/dev/null || true)}"
+[ -n "$PRIVATE_DENYLIST" ] || { echo "pre-push: no deny-list; run tools/setup-clone.sh or set PRIVATE_DENYLIST"; exit 1; }
+case "$PRIVATE_DENYLIST" in /*) ;; *) PRIVATE_DENYLIST="$PWD/$PRIVATE_DENYLIST" ;; esac
+[ -f "$PRIVATE_DENYLIST" ] || { echo "pre-push: the deny-list file is missing"; exit 1; }
+zero=0000000000000000000000000000000000000000
+rc=0
+while read -r local_ref local_sha _ remote_sha; do
+  [ "$local_sha" = "$zero" ] && continue                 # deleting a remote branch or tag: nothing to scan
+  # an annotated tag carries its own tagger, time zone and message: scan them like a commit's
+  if [ "$(git cat-file -t "$local_sha" 2>/dev/null)" = "tag" ]; then
+    python3 tools/check_private.py --tag "$local_sha" || { echo "pre-push: refused tag $local_ref"; rc=1; }
+  fi
+  if [ "$remote_sha" = "$zero" ]; then range="$local_sha"; else range="$remote_sha..$local_sha"; fi
+  CHECK_RANGE="$range" tools/check-private.sh || rc=1
+done
+[ -f tools/build_catalog.py ] && { python3 tools/build_catalog.py --check || rc=1; }
+[ -f tools/check_links.py ] && { python3 tools/check_links.py || rc=1; }
+[ -f tools/check_licences.py ] && { python3 tools/check_licences.py || rc=1; }
+REUSE=$(command -v reuse || true); [ -z "$REUSE" ] && [ -x "$HOME/.venvs/reuse/bin/reuse" ] && REUSE="$HOME/.venvs/reuse/bin/reuse"
+if [ -n "$REUSE" ]; then "$REUSE" lint -q || { "$REUSE" lint | tail -20; rc=1; }; fi
+[ "$rc" = 0 ] || echo "pre-push: refused"
+exit $rc
