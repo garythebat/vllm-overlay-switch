@@ -50,8 +50,18 @@ def agree(results: list[Any], variant: str | None = None) -> tuple[bool, str]:
     return True, ""
 
 
-async def flip(engine, variant: str, mode: str) -> tuple[dict, int]:
-    """Pause, copy on every rank, verify, resume. Returns (answer, HTTP status)."""
+def all_prepared(results: list[Any]) -> bool:
+    """Has every rank found both sets and checked them against its live model?"""
+    return isinstance(results, list) and bool(results) and all(isinstance(r, dict) and r.get("prepared") for r in results)
+
+
+async def flip(engine, variant: str, mode: str, force: bool = False) -> tuple[dict, int]:
+    """Pause, copy on every rank, verify, resume. Returns (answer, HTTP status).
+
+    `force` is the way out of an unclear state (ranks that disagree, or weights that match
+    neither set, as a flip that failed halfway leaves them): the chosen set is written onto
+    every rank whatever is there now. There is then nothing to put back if it fails.
+    """
     t0 = time.monotonic()
     timings: dict[str, float] = {}
 
@@ -60,19 +70,20 @@ async def flip(engine, variant: str, mode: str) -> tuple[dict, int]:
 
     try:
         before = await rpc("overlay_status", STATUS_TIMEOUT_S)
-        if not all(isinstance(r, dict) and r.get("prepared") for r in before):
+        if not all_prepared(before):
             t = time.monotonic()
-            prepared = await rpc("overlay_prepare", PREPARE_TIMEOUT_S)
+            before = await rpc("overlay_prepare", PREPARE_TIMEOUT_S)
             timings["prepare_s"] = round(time.monotonic() - t, 3)
-            ok, why = agree(prepared)
-            if not ok:
-                return {"ok": False, "error": f"could not prepare the alternate set: {why}", "ranks": prepared}, 500
-            before = prepared
+            if not all_prepared(before):
+                _, why = agree(before)
+                return {"ok": False, "error": f"could not prepare the alternate set: {why}", "ranks": before}, 500
         ok, why = agree(before)
-        if not ok:
-            return {"ok": False, "error": f"refusing to flip from an unclear state: {why}", "ranks": before}, 500
-        previous = before[0]["active"]
-        if previous == variant:
+        if not ok and not force:
+            return {"ok": False, "ranks": before,
+                    "error": f"refusing to flip from an unclear state: {why}. "
+                             f"Send \"force\": true to write {variant!r} onto every rank anyway."}, 409
+        previous = before[0]["active"] if ok else None
+        if previous == variant and not force:
             return {"ok": True, "changed": False, "active": variant, "ranks": before, "timings": timings}, 200
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"[:400]}, 500
@@ -100,16 +111,20 @@ async def flip(engine, variant: str, mode: str) -> tuple[dict, int]:
         timings["copy_s"] = round(time.monotonic() - t, 3)
         if not ok:
             # put every rank back on what it had; a model split across two sets must not answer
-            try:
-                back = await rpc("overlay_switch", SWITCH_TIMEOUT_S, previous)
-                back_ok, back_why = agree(back, previous)
-            except Exception as e:
-                back, back_ok, back_why = [], False, f"{type(e).__name__}: {e}"[:300]
+            if previous is None:
+                back, back_ok, back_why = [], False, "the state before was unclear, so there is nothing to put back"
+            else:
+                try:
+                    back = await rpc("overlay_switch", SWITCH_TIMEOUT_S, previous)
+                    back_ok, back_why = agree(back, previous)
+                except Exception as e:
+                    back, back_ok, back_why = [], False, f"{type(e).__name__}: {e}"[:300]
             if not back_ok:
                 resume = False
                 return {"ok": False, "paused": True, "active": None, "ranks": back or after, "timings": timings,
-                        "error": f"the flip failed ({why}) and so did putting {previous!r} back ({back_why}). "
-                                 "Generation is left PAUSED: the ranks may hold different weights. Restart the server."}, 500
+                        "error": f"the flip failed ({why}) and so did putting the previous set back ({back_why}). "
+                                 "Generation is left PAUSED: the ranks may hold different weights. "
+                                 "Flip again with \"force\": true, or restart the server."}, 500
             await engine.reset_prefix_cache()
             return {"ok": False, "changed": False, "active": previous, "ranks": back, "timings": timings,
                     "error": f"the flip failed ({why}); {previous!r} was put back on every rank"}, 500

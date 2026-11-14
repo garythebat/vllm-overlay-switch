@@ -3,14 +3,16 @@
 Two routes, attached through the engine's own `vllm.endpoint_plugins` mechanism, so no
 engine file is edited and the developer mode stays off:
 
-    GET  /overlay/status            which set is active on every rank
-    POST /overlay/switch            {"variant": "base" | "overlay", "mode": "wait" | "abort"}
+    GET  /overlay/status            which set is active on every rank (?full=1 reads every tensor)
+    POST /overlay/switch            {"variant": "base" | "overlay", "mode": "wait" | "abort",
+                                     "force": false}
 
 A flip is: pause generation (running requests finish in "wait" mode, the prefix cache is
 cleared), copy the chosen set into the live buffers on every rank, check that every rank
 agrees, resume. If ranks disagree the previous set is copied back; if that fails as well,
 generation stays paused and the answer says so, because a model whose ranks hold different
-weights must not answer anyone.
+weights must not answer anyone. `"force": true` is the way out of that state: it writes the
+chosen set onto every rank whatever is there, and resumes only if every rank then agrees.
 
 Who may call it: the local machine only, unless OVERLAY_SWITCH_ALLOW lists other client
 addresses. If OVERLAY_SWITCH_TOKEN is set, every call must also carry it in the
@@ -42,8 +44,10 @@ class OverlaySwitchEndpointPlugin:
             engine = _engine(raw_request)
             if engine is None:
                 return JSONResponse({"ok": False, "error": "no engine on this server"}, status_code=503)
+            # ?full=1 reads every tensor back instead of the first and last layer
+            full = raw_request.query_params.get("full", "") in ("1", "true", "yes")
             try:
-                ranks = await engine.collective_rpc("overlay_status", timeout=STATUS_TIMEOUT_S)
+                ranks = await engine.collective_rpc("overlay_status", timeout=STATUS_TIMEOUT_S, args=(full,))
                 paused = await engine.is_paused()
             except Exception as e:  # the extension is missing, or a rank did not answer
                 return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"[:400]}, status_code=500)
@@ -65,16 +69,18 @@ class OverlaySwitchEndpointPlugin:
                 body = None
             if not isinstance(body, dict):
                 return JSONResponse({"ok": False, "error": "send a JSON object"}, status_code=400)
-            variant, mode = body.get("variant"), body.get("mode", "wait")
+            variant, mode, force = body.get("variant"), body.get("mode", "wait"), body.get("force", False)
             if variant not in VARIANTS:
                 return JSONResponse({"ok": False, "error": f"variant must be one of {list(VARIANTS)}"}, status_code=400)
             if mode not in PAUSE_MODES:
                 return JSONResponse({"ok": False, "error": f"mode must be one of {list(PAUSE_MODES)}"}, status_code=400)
+            if not isinstance(force, bool):
+                return JSONResponse({"ok": False, "error": "force must be true or false"}, status_code=400)
             lock: asyncio.Lock = raw_request.app.state.overlay_switch_lock
             if lock.locked():
                 return JSONResponse({"ok": False, "error": "another flip is under way"}, status_code=409)
             async with lock:
-                answer, status = await flip(engine, variant, mode)
+                answer, status = await flip(engine, variant, mode, force)
             return JSONResponse(answer, status_code=status)
 
     async def init_state(self, engine_client, state, args) -> None:
