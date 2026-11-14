@@ -11,9 +11,8 @@
 # Put this file in your spark-vllm-docker checkout, and recipe.yaml in its recipes/ folder under the name
 # used on the last line. DRY=1 prints the launcher's dry run (the final vLLM command) and starts nothing.
 #
-# This is the script the runs of 14 November 2026 were started with, except for three lines changed
-# here: the default cache folder, the recipe's path, and the name it prints. It has not been run in this
-# form.
+# The test runs were started with this script, except for three lines changed for publication: the
+# default cache folder, the recipe's path, and the name it prints. The published form has not been run.
 set -eu
 cd "$(dirname "$0")"
 export HF_HOME=${HF_HOME:-$HOME/.cache/huggingface}

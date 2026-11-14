@@ -1,44 +1,45 @@
-# What to add to a recipe of eugr/spark-vllm-docker to get the overlay switch.
+# Settings to add to a spark-vllm-docker recipe to enable the overlay switch.
 #
-# This is a fragment, not a recipe: merge the four marked items into the recipe you already
-# serve the BASE checkpoint with (the fifth to seventh are optional). Paths are placeholders. Not
-# run as written; see the README for what has and has not been tested.
+# This is a fragment, not a complete recipe. Merge the four numbered items into the recipe that
+# serves your BASE checkpoint; items 5 to 7 are optional. Paths are placeholders. The fragment
+# itself has not been run as written: for a complete, tested recipe see
+# examples/deepseek-v4.1-flash-1017/.
 
 mods:
   - mods/overlay-switch        # (1) a copy of this repository's mod/ folder inside your
                                #     spark-vllm-docker checkout (or pass --apply-mod with a path)
 
 env:
-  # (2) VLLM_PLUGINS is an allow-list for every vLLM plugin, comma separated, no spaces.
-  #     Name the switch and everything the image already loads. The mod prints the exact
-  #     value for your image when it installs; the two after overlay_switch are vLLM's own.
+  # (2) VLLM_PLUGINS is an allow-list for all vLLM plugins: comma-separated, no spaces. It must
+  #     name the switch and every plugin the image already loads. The mod prints the exact
+  #     value for your image when it installs. The two after overlay_switch are vLLM's own.
   VLLM_PLUGINS: "overlay_switch,lora_filesystem_resolver,lora_hf_hub_resolver"
 
-  # (3) The side file with the alternate tensors, as the container sees it. It must be
-  #     readable at this path on every machine of the cluster.
+  # (3) The side file with the overlay's tensors, as seen from inside the container. It must be
+  #     readable at this path on every node of the cluster.
   OVERLAY_SWITCH_FILE: "/root/.cache/huggingface/overlay/side.safetensors"
 
-  # (5) Optional: two endpoints on the one server. With this set, the base set answers on
-  #     the usual paths (http://HOST:8000/v1) and the overlay under the prefix
-  #     (http://HOST:8000/free/v1), and the server flips by itself. Leave it out to keep
-  #     one endpoint and flip by hand.
+  # (5) Optional: two endpoints on one server. The base variant is served on the standard
+  #     paths (http://HOST:8000/v1), the overlay under the prefix (http://HOST:8000/free/v1),
+  #     and the server switches automatically. Without it there is one endpoint and switching
+  #     is manual.
   # OVERLAY_GATE_PREFIX: "/free"
 
-  # (6) Optional, with (5): model names that mean the overlay on the usual paths, for clients
-  #     that pick from the model list. Serve them as further names of the one model: add
-  #     `--served-model-name BASE_NAME OVERLAY_NAME` to the command, the base name first.
+  # (6) Optional, requires (5): model names that select the overlay on the standard paths, for
+  #     clients that choose from the model list. Add them as extra served names of the model:
+  #     `--served-model-name BASE_NAME OVERLAY_NAME`, base name first.
   # OVERLAY_GATE_MODELS: "OVERLAY_NAME"
 
-  # (7) Optional, with (5): put reasoning_effort into words the model takes, for clients with a
-  #     ladder of their own. KEEP turns it on: the words passed on as they are. MAP rewrites
-  #     words (`*` is any other value). INT accepts integers and clamps them into the range.
-  #     The values below fit DeepSeek V4.1 on the engine build named in the README.
+  # (7) Optional, requires (5): translate reasoning_effort into values the model accepts. KEEP
+  #     enables the feature and lists the values passed through unchanged. MAP rewrites values
+  #     (`*` matches any other value). INT accepts integers and clamps them to the range. The
+  #     values below are for DeepSeek V4.1 on the engine build listed in the README.
   # OVERLAY_GATE_EFFORT_KEEP: "none,low,high,xhigh,max"
   # OVERLAY_GATE_EFFORT_MAP: "minimal=low,medium=high,ultra=max,*=high"
   # OVERLAY_GATE_EFFORT_INT: "1-100"
 
-  # Optional. Who may call the switch besides the machine the server runs on, and a shared
-  # secret that every call must then carry in the X-Overlay-Token header.
+  # Optional: client addresses allowed to call the switch routes in addition to localhost, and
+  # a shared secret that every call must then send in the X-Overlay-Token header.
   # OVERLAY_SWITCH_ALLOW: "192.0.2.10,192.0.2.11"
   # OVERLAY_SWITCH_TOKEN: "choose-your-own"
 
@@ -46,4 +47,4 @@ command: |
   vllm serve /path/to/the/base/checkpoint \
       --load-format b12x \
       --worker-extension-cls vllm_overlay_switch.worker.OverlayWorkerExtension
-#     (4) the last line above; keep every other flag of your recipe as it is
+#     (4) the last line above; keep all other flags of your recipe unchanged

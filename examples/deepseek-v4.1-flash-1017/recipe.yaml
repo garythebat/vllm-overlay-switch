@@ -2,23 +2,23 @@
 # SPDX-FileCopyrightText: 2026 garythebat
 # SPDX-License-Identifier: MIT AND Apache-2.0
 #
-# The recipe this project was run with on 14 November 2026: DeepSeek V4.1 Flash 1017 on three DGX Spark
-# machines, tensor parallel 3, the base weights and the Keys overlay served from one loaded copy.
-# Below the header it is the file as it ran, except for the `description` line.
+# Recipe used for this project's tests: DeepSeek V4.1 Flash 1017 on three DGX Spark nodes, tensor
+# parallel 3, with the base weights and the Keys overlay served from one loaded copy. Apart from this
+# header and the `description` line, it is the file the test runs used.
 #
 # Derived from recipes/3x-spark-cluster/deepseek-v4.1-flash.yaml of eugr/spark-vllm-docker at commit
 # a4c172976a5f9f8669b356a0891bf972cae14fd4 (MIT, Copyright (c) 2026 Eugene Rakhmatulin; the licence text is
-# in LICENSES/MIT.txt of this repository). What was changed, and why:
+# in LICENSES/MIT.txt of this repository). Changes:
 #   memory  B12X_COMPILE_WORKERS 4 -> 2; MAX_JOBS, NINJAFLAGS, MAKEFLAGS and FLASHINFER_NVCC_THREADS added;
 #           max_model_len auto -> 262144; max_num_batched_tokens 4096 -> 2048; images off;
-#           --mm-processor-cache-gb 0; --max-cudagraph-capture-size 16. With these the three machines had
-#           7.1 / 8.8 / 7.9 GiB free when the server was ready.
-#   model   the 1017 release instead of the first one, with the first release's chat template (README.md
-#           in this folder says why).
+#           --mm-processor-cache-gb 0; --max-cudagraph-capture-size 16. With these settings the three
+#           nodes had 7.1 / 8.8 / 7.9 GiB free once the server was ready.
+#   model   the 1017 release instead of the first release, with the first release's chat template (see
+#           README.md in this folder).
 #   switch  the mod; VLLM_PLUGINS; OVERLAY_SWITCH_FILE; OVERLAY_SWITCH_BASE_DIR; OVERLAY_GATE_PREFIX;
 #           OVERLAY_GATE_MODELS; the three OVERLAY_GATE_EFFORT_ settings; and in the command
 #           --worker-extension-cls and --served-model-name with two names.
-# Paths under /root/.cache/huggingface are paths inside the container: the Hugging Face cache mount.
+# Paths under /root/.cache/huggingface are paths inside the container (the Hugging Face cache mount).
 
 recipe_version: "1"
 name: DeepSeek-V4.1-Flash-1017 with the overlay switch (TP=3, lean, chat template from the 2cba9e42 release)
