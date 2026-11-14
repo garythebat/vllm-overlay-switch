@@ -21,6 +21,7 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", "mod"))
 
 from test_logic import FakeEngine  # noqa: E402
+from vllm_overlay_switch import effort as efforts  # noqa: E402
 from vllm_overlay_switch import gate as gating  # noqa: E402
 
 CHAT, FREE_CHAT = "/v1/chat/completions", "/free/v1/chat/completions"
@@ -32,6 +33,7 @@ class Behind:
     def __init__(self, engine):
         self.engine, self.seen, self.release, self.running, self.headers = engine, [], {}, 0, []
         self.most_at_once = 0
+        self.models = None        # (status, headers, body chunks) to answer GET /v1/models with
 
     async def __call__(self, scope, receive, send):
         message = await receive()
@@ -45,6 +47,12 @@ class Behind:
         entry = {"name": name, "path": scope["path"], "method": scope["method"], "body": body, "request": request,
                  "length": dict(scope["headers"]).get(b"content-length"), "held_at_start": list(self.engine.active)}
         self.seen.append(entry)
+        if self.models and scope["path"] == "/v1/models":
+            status, headers, chunks = self.models
+            await send({"type": "http.response.start", "status": status, "headers": list(headers)})
+            for n, chunk in enumerate(chunks):
+                await send({"type": "http.response.body", "body": chunk, "more_body": n < len(chunks) - 1})
+            return
         self.running += 1
         self.most_at_once = max(self.most_at_once, self.running)
         await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"application/json")]})
@@ -122,12 +130,12 @@ class SlowFlip(FakeEngine):
 
 
 class GateCase(unittest.TestCase):
-    def make(self, engine=None, key=None, models=()):
+    def make(self, engine=None, key=None, models=(), effort=None):
         self.engine = engine or FakeEngine()
         self.behind = Behind(self.engine)
         self.app_obj = types.SimpleNamespace(state=types.SimpleNamespace(overlay_switch_engine=self.engine))
         check = (lambda inner: EngineKey(inner, key)) if key else None
-        self.mw = gating.OverlayGateMiddleware(self.behind, prefix="/free", key_check=check, overlay_models=models)
+        self.mw = gating.OverlayGateMiddleware(self.behind, prefix="/free", key_check=check, overlay_models=models, effort=effort)
         return self.mw
 
     def post(self, path, name, **extra):
@@ -404,6 +412,83 @@ class ByName(GateCase):
             os.environ.pop(gating.MODELS_ENV, None)
             if saved is not None:
                 os.environ[gating.MODELS_ENV] = saved
+
+
+def seven_steps():
+    """A model that takes none, low, high, xhigh, max and 1 to 100, behind a client with seven steps."""
+    return efforts.Effort(["none", "low", "high", "xhigh", "max"], {"minimal": "low", "medium": "high", "ultra": "max"}, "high", (1, 100))
+
+
+class Effort(GateCase):
+    """The gate rewrites every chat request anyway; it can put reasoning_effort into words the model takes."""
+
+    def test_a_chat_request_is_translated_on_both_sides_and_says_so(self):
+        async def scenario():
+            self.make(models=("m-free",), effort=seven_steps())
+            for path, model, side in ((CHAT, "m", "base"), (CHAT, "m-free", "overlay"), (FREE_CHAT, "m", "overlay")):
+                status, headers, _ = await call(self.mw, self.app_obj, path, {"name": "c", "model": model, "reasoning_effort": "medium"})
+                sent = self.behind.seen[-1]["request"]
+                self.assertEqual((status, headers[b"x-overlay-side"].decode(), headers[b"x-reasoning-effort"], sent["reasoning_effort"]),
+                                 (200, side, b"medium -> high", "high"), (path, model))
+            status, headers, _ = await call(self.mw, self.app_obj, CHAT, {"name": "c", "reasoning_effort": 0,
+                                                                          "chat_template_kwargs": {"reasoning_effort": "ultra"}})
+            sent = self.behind.seen[-1]["request"]
+            self.assertEqual((headers[b"x-reasoning-effort"], sent["chat_template_kwargs"], "reasoning_effort" in sent),
+                             (b"ultra -> max; 0 dropped (chat_template_kwargs has its own)", {"reasoning_effort": "max"}, False))
+            self.assertEqual(self.mw.effort.describe()["coerced"]["medium -> high"], 3)
+        asyncio.run(scenario())
+
+    def test_what_needs_no_translation_carries_no_such_header(self):
+        async def scenario():
+            self.make(effort=seven_steps())
+            for body in ({"name": "c"}, {"name": "c", "reasoning_effort": "high"}, {"name": "c", "chat_template_kwargs": {"reasoning_effort": 40}}):
+                _, headers, _ = await call(self.mw, self.app_obj, CHAT, dict(body))
+                sent = {k: v for k, v in self.behind.seen[-1]["request"].items() if k != "cache_salt"}
+                self.assertEqual((b"x-reasoning-effort" in headers, sent), (False, body))
+        asyncio.run(scenario())
+
+    def test_only_the_chat_route_is_translated(self):
+        async def scenario():
+            self.make(effort=seven_steps())
+            for path in ("/v1/completions", "/v1/responses", "/v1/messages", "/free/v1/completions"):
+                _, headers, _ = await call(self.mw, self.app_obj, path, {"name": "c", "reasoning_effort": "medium"})
+                self.assertEqual((b"x-reasoning-effort" in headers, self.behind.seen[-1]["request"]["reasoning_effort"]), (False, "medium"), path)
+        asyncio.run(scenario())
+
+    def test_without_it_nothing_is_translated(self):
+        async def scenario():
+            self.make()
+            _, headers, _ = await call(self.mw, self.app_obj, CHAT, {"name": "c", "reasoning_effort": "medium"})
+            self.assertEqual((b"x-reasoning-effort" in headers, self.behind.seen[-1]["request"]["reasoning_effort"]), (False, "medium"))
+        asyncio.run(scenario())
+
+    def test_the_model_list_says_what_is_accepted_on_both_addresses(self):
+        async def scenario():
+            self.make(effort=seven_steps())
+            listing = json.dumps({"object": "list", "data": [{"id": "m"}, {"id": "m-free"}]}).encode()
+            self.behind.models = (200, [(b"content-type", b"application/json"), (b"content-length", str(len(listing)).encode())],
+                                  [listing[:20], listing[20:]])                              # sent in two pieces
+            for path in ("/v1/models", "/free/v1/models"):
+                status, headers, body = await call(self.mw, self.app_obj, path, method="GET")
+                got = json.loads(body)
+                self.assertEqual((status, int(headers[b"content-length"]), [m["id"] for m in got["data"]]), (200, len(body), ["m", "m-free"]), path)
+                for model in got["data"]:
+                    self.assertEqual((model["reasoning_efforts"], model["reasoning_effort_integer_max"]), (["none", "low", "high", "xhigh", "max"], 100))
+        asyncio.run(scenario())
+
+    def test_a_model_list_that_is_not_one_goes_out_as_it_came(self):
+        async def scenario():
+            self.make(effort=seven_steps())
+            for status, extra, body in ((500, [], b'{"error": "down"}'), (200, [], b"not json"), (200, [(b"content-encoding", b"gzip")], b'{"data": []}'),
+                                        (200, [], b'{"data": "x"}')):
+                headers = [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode()), *extra]
+                self.behind.models = (status, headers, [body])
+                got_status, got_headers, got_body = await call(self.mw, self.app_obj, "/v1/models", method="GET")
+                self.assertEqual((got_status, got_body, got_headers), (status, body, dict(headers)), body)
+            self.make()                                                                     # and without the translation: untouched
+            self.behind.models = (200, [(b"content-length", b"26")], [b'{"data": [{"id": "plain"}]}'])
+            self.assertEqual((await call(self.mw, self.app_obj, "/v1/models", method="GET"))[2], b'{"data": [{"id": "plain"}]}')
+        asyncio.run(scenario())
 
 
 class WhatPasses(GateCase):

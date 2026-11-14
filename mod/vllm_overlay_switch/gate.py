@@ -38,6 +38,9 @@ path under the prefix does not begin that way when the engine looks at it. So th
 the engine's own check (`key_check`) and runs it again for every request under the prefix, on
 the path the request is really for. Without it the prefix would be a way around the key.
 
+Since the gate rewrites every chat request anyway, it can also translate `reasoning_effort`
+into what the served model accepts (effort.py, off unless configured).
+
 No engine import here: the gate needs an object with the engine client's `collective_rpc`,
 `pause_generation`, `resume_generation` and `is_paused`, and is tested without an engine.
 """
@@ -52,6 +55,7 @@ import json
 import os
 import time
 
+from . import effort as efforts
 from .logic import VARIANTS, flip
 
 PREFIX_ENV = "OVERLAY_GATE_PREFIX"
@@ -186,20 +190,21 @@ def gate_of(state) -> Gate:
     return gate
 
 
-def install(app, prefix: str, key_check=None, overlay_models=()) -> None:
+def install(app, prefix: str, key_check=None, overlay_models=(), effort=None) -> None:
     """Called by the endpoint plugin while the app is built, before the engine adds its own middleware:
     the gate is then the innermost one and sees only requests that passed the engine's own checks.
 
     `key_check` wraps an ASGI app in the engine's API-key check, or is None on a server without a key.
-    `overlay_models` are model names that choose the overlay on the usual paths."""
+    `overlay_models` are model names that choose the overlay on the usual paths.
+    `effort` translates reasoning_effort on chat requests (effort.Effort), or is None."""
     prefix = "/" + prefix.strip("/")
     if prefix == "/" or any(p == prefix or p.startswith(prefix + "/") for p in MODEL_PATHS + PASS_PATHS + SWITCH_PATHS):
         raise ValueError(f"{PREFIX_ENV}={prefix!r} is not a usable path prefix")
     models = tuple(dict.fromkeys(overlay_models))
     if any(not isinstance(name, str) or not name for name in models):
         raise ValueError(f"{MODELS_ENV} must be model names: {overlay_models!r}")
-    app.state.overlay_gate_prefix, app.state.overlay_gate_models = prefix, models
-    app.add_middleware(OverlayGateMiddleware, prefix=prefix, key_check=key_check, overlay_models=models)
+    app.state.overlay_gate_prefix, app.state.overlay_gate_models, app.state.overlay_gate_effort = prefix, models, effort
+    app.add_middleware(OverlayGateMiddleware, prefix=prefix, key_check=key_check, overlay_models=models, effort=effort)
 
 
 def side_salt(side: str, client) -> str:
@@ -217,8 +222,8 @@ def side_salt(side: str, client) -> str:
 class OverlayGateMiddleware:
     """Pure ASGI middleware. The gate itself is made at the first request, when the engine client is there."""
 
-    def __init__(self, app, prefix: str, key_check=None, overlay_models=()):
-        self.app, self.prefix, self.overlay_models = app, prefix, frozenset(overlay_models)
+    def __init__(self, app, prefix: str, key_check=None, overlay_models=(), effort=None):
+        self.app, self.prefix, self.overlay_models, self.effort = app, prefix, frozenset(overlay_models), effort
         under = functools.partial(self._serve, True)
         # what comes in under the prefix has not met the engine's key check on the path it is for: it meets it here
         self._under = key_check(under) if key_check else under
@@ -241,6 +246,8 @@ class OverlayGateMiddleware:
     async def _serve(self, under: bool, scope, receive, send):
         """`under`: the request came in under the prefix (and `scope` already names the inner path)."""
         inner = scope["path"]
+        if self.effort and scope["method"] == "GET" and inner == efforts.MODELS_PATH:
+            return await self.app(scope, receive, _advertising(send, self.effort))
         if scope["method"] in ("GET", "HEAD", "OPTIONS") or inner in PASS_PATHS:
             return await self.app(scope, receive, send)
         if inner in SWITCH_PATHS and not under:
@@ -261,6 +268,7 @@ class OverlayGateMiddleware:
             model = request.get("model")
             side = "overlay" if under or (isinstance(model, str) and model in self.overlay_models) else "base"
             request["cache_salt"] = side_salt(side, request.get("cache_salt"))
+            notes = self.effort.apply(request) if self.effort and inner == efforts.CHAT_PATH else []
             body = json.dumps(request).encode()
             gate = self.gate(scope)
             await gate.enter(side)
@@ -269,7 +277,7 @@ class OverlayGateMiddleware:
         try:
             headers = [(k, v) for k, v in scope["headers"] if k.lower() not in (b"content-length", b"transfer-encoding")]
             headers.append((b"content-length", str(len(body)).encode()))
-            await self.app(dict(scope, headers=headers), _replay(body, receive), _mark(send, side))
+            await self.app(dict(scope, headers=headers), _replay(body, receive), _mark(send, side, notes))
         finally:
             gate.leave()
 
@@ -303,14 +311,44 @@ def _replay(body: bytes, receive):
     return replay
 
 
-def _mark(send, side: str):
+def _mark(send, side: str, notes=()):
+    """Every answer says its side, and what was done to its reasoning_effort if anything was."""
+    extra = [(HEADER, side.encode())] + ([(efforts.HEADER, efforts.header_value(list(notes)))] if notes else [])
+
     async def marked(message):
         if message["type"] == "http.response.start":
-            headers = [(k, v) for k, v in message.get("headers", []) if k.lower() != HEADER]
-            message = dict(message, headers=headers + [(HEADER, side.encode())])
+            headers = [(k, v) for k, v in message.get("headers", []) if k.lower() not in (HEADER, efforts.HEADER)]
+            message = dict(message, headers=headers + extra)
         await send(message)
 
     return marked
+
+
+def _advertising(send, effort):
+    """The model list, with the accepted effort values added to every model. Whatever is not a plain model
+    list (another status, a body that does not parse, an encoded body) goes out exactly as it came."""
+    start, chunks = None, []
+
+    async def held(message):
+        nonlocal start
+        if message["type"] == "http.response.start":
+            start = message
+            return
+        if message["type"] != "http.response.body" or start is None:
+            return await send(message)
+        chunks.append(message.get("body", b""))
+        if message.get("more_body"):
+            return
+        body = b"".join(chunks)
+        plain = start["status"] == 200 and not any(k.lower() == b"content-encoding" for k, _ in start.get("headers", []))
+        new = effort.advertise(body) if plain else None
+        if new is not None:
+            headers = [(k, v) for k, v in start.get("headers", []) if k.lower() != b"content-length"]
+            start, body = dict(start, headers=headers + [(b"content-length", str(len(new)).encode())]), new
+        await send(start)
+        await send({"type": "http.response.body", "body": body})
+
+    return held
 
 
 async def _answer(send, status: int, message: str) -> None:

@@ -25,7 +25,8 @@ except Exception:  # pragma: no cover
 
 from test_logic import FakeEngine  # noqa: E402
 
-ENV = ("OVERLAY_SWITCH_ALLOW", "OVERLAY_SWITCH_TOKEN", "OVERLAY_GATE_PREFIX", "OVERLAY_GATE_MODELS")
+ENV = ("OVERLAY_SWITCH_ALLOW", "OVERLAY_SWITCH_TOKEN", "OVERLAY_GATE_PREFIX", "OVERLAY_GATE_MODELS",
+       "OVERLAY_GATE_EFFORT_KEEP", "OVERLAY_GATE_EFFORT_MAP", "OVERLAY_GATE_EFFORT_INT")
 AUTH_MODULE = "vllm.entrypoints.serve.middleware.authenticate"
 
 
@@ -93,7 +94,12 @@ class Routes(unittest.TestCase):
 
         @self.app.post("/v1/chat/completions")           # stands in for the engine's own route
         async def chat(body: dict):
-            return {"salt": body.get("cache_salt"), "held": list(self.engine.active)}
+            said = {"effort": body.get("reasoning_effort"), "kwargs": body.get("chat_template_kwargs")}
+            return {"salt": body.get("cache_salt"), "held": list(self.engine.active), **{k: v for k, v in said.items() if v is not None}}
+
+        @self.app.get("/v1/models")
+        async def models():
+            return {"object": "list", "data": [{"id": "m"}, {"id": "m-free"}]}
 
         plugin = self.api.OverlaySwitchEndpointPlugin()
         plugin.attach_router(self.app)
@@ -200,7 +206,7 @@ class Routes(unittest.TestCase):
         os.environ["OVERLAY_GATE_PREFIX"] = "/free"
         c = self.client()
         gate = c.get("/overlay/status").json()["gate"]
-        self.assertEqual((gate["prefix"], gate["models"], gate["live"], gate["flips"]), ("/free", [], None, 0))
+        self.assertEqual((gate["prefix"], gate["models"], gate["effort"], gate["live"], gate["flips"]), ("/free", [], None, None, 0))
         free = c.post("/free/v1/chat/completions", json={"messages": []})
         self.assertEqual((free.status_code, free.headers["x-overlay-side"]), (200, "overlay"))
         self.assertEqual(free.json(), {"salt": "overlay-gate:overlay", "held": ["overlay"] * 3})
@@ -224,6 +230,33 @@ class Routes(unittest.TestCase):
         usual = c.post("/v1/chat/completions", json={"model": "m", "messages": []})
         self.assertEqual((usual.headers["x-overlay-side"], usual.json()["held"]), ("base", ["base"] * 3))
         self.assertEqual(c.get("/overlay/status").json()["gate"]["flips"], 2)
+
+    def test_with_the_effort_settings_a_chat_request_is_translated_and_the_list_and_the_status_say_how(self):
+        os.environ.update({"OVERLAY_GATE_PREFIX": "/free", "OVERLAY_GATE_MODELS": "m-free", "OVERLAY_GATE_EFFORT_KEEP": "none,low,high,xhigh,max",
+                           "OVERLAY_GATE_EFFORT_MAP": "minimal=low,medium=high,ultra=max,*=high", "OVERLAY_GATE_EFFORT_INT": "1-100"})
+        c = self.client()
+        for path, model in (("/v1/chat/completions", "m"), ("/v1/chat/completions", "m-free"), ("/free/v1/chat/completions", "m")):
+            for sent, top, kwargs, note in (("medium", "high", None, "medium -> high"), ("minimal", "low", None, "minimal -> low"),
+                                            ("ultra", "max", None, "ultra -> max"), ("banana", "high", None, "banana -> high (unknown)"),
+                                            (50, None, 50, "50 moved to chat_template_kwargs"), (0, None, 1, "0 -> 1"), (101, None, 100, "101 -> 100")):
+                answer = c.post(path, json={"model": model, "messages": [], "reasoning_effort": sent})
+                self.assertEqual((answer.status_code, answer.json().get("effort"), (answer.json().get("kwargs") or {}).get("reasoning_effort"),
+                                  answer.headers["x-reasoning-effort"]), (200, top, kwargs, note), (path, model, sent))
+                inner = c.post(path, json={"model": model, "messages": [], "chat_template_kwargs": {"reasoning_effort": sent}})
+                self.assertEqual(inner.json()["kwargs"]["reasoning_effort"], top if top is not None else kwargs, (path, model, sent))
+        plain = c.post("/v1/chat/completions", json={"model": "m", "messages": []})
+        self.assertEqual(("x-reasoning-effort" in plain.headers, "effort" in plain.json(), "kwargs" in plain.json()), (False, False, False))
+        for path in ("/v1/models", "/free/v1/models"):
+            listed = c.get(path).json()["data"]
+            self.assertEqual([(m["id"], m["reasoning_efforts"], m["reasoning_effort_integer_max"]) for m in listed],
+                             [(name, ["none", "low", "high", "xhigh", "max"], 100) for name in ("m", "m-free")])
+        effort = c.get("/overlay/status").json()["gate"]["effort"]
+        self.assertEqual((effort["keep"], effort["int"], effort["coerced"]["medium -> high"]), (["none", "low", "high", "xhigh", "max"], [1, 100], 6))
+
+    def test_a_mistake_in_the_effort_settings_stops_the_server(self):
+        os.environ.update({"OVERLAY_GATE_PREFIX": "/free", "OVERLAY_GATE_EFFORT_KEEP": "low,high", "OVERLAY_GATE_EFFORT_MAP": "medium=hgih"})
+        with self.assertRaises(ValueError):
+            self.client()
 
     def test_under_the_gate_only_a_forced_flip_is_taken_by_hand(self):
         os.environ["OVERLAY_GATE_PREFIX"] = "/free"

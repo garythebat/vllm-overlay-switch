@@ -18,7 +18,8 @@ With OVERLAY_GATE_PREFIX set (see gate.py) the same server answers on two sets o
 base set on the usual ones and the overlay under the prefix, and flips by itself. With
 OVERLAY_GATE_MODELS as well, a request on the usual paths gets the overlay by naming one of
 those models. The switch route then only takes a forced flip, the way out of a failed one:
-which side is live is no longer anyone's to choose by hand.
+which side is live is no longer anyone's to choose by hand. With OVERLAY_GATE_EFFORT_KEEP the
+gate also translates reasoning_effort on chat requests into what the model accepts (effort.py).
 
 Who may call these two routes: the local machine only, unless OVERLAY_SWITCH_ALLOW lists other client
 addresses. If OVERLAY_SWITCH_TOKEN is set, every call must also carry it in the
@@ -35,6 +36,7 @@ import asyncio
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from . import effort as efforts
 from . import gate as gating
 from .logic import PAUSE_MODES, STATUS_TIMEOUT_S, VARIANTS, agree, flip, refusal, same_files
 
@@ -53,7 +55,7 @@ class OverlaySwitchEndpointPlugin:
                 # the line of waiting requests and the count of those in flight live in one process
                 raise RuntimeError(f"the overlay gate needs one API server process, not {servers} (--api-server-count)")
             # added here, before the engine adds its own middleware: the gate is then the innermost one
-            gating.install(app, prefix, engine_key_check(app), gating.models_from_env())
+            gating.install(app, prefix, engine_key_check(app), gating.models_from_env(), efforts.from_env())
 
         @app.get("/overlay/status")
         async def overlay_status(raw_request: Request):
@@ -78,7 +80,9 @@ class OverlaySwitchEndpointPlugin:
             gated = getattr(raw_request.app.state, "overlay_gate_prefix", None)
             if gated:
                 gate = getattr(raw_request.app.state, "overlay_gate", None)
+                effort = getattr(raw_request.app.state, "overlay_gate_effort", None)
                 answer["gate"] = {"prefix": gated, "models": list(getattr(raw_request.app.state, "overlay_gate_models", ())),
+                                  "effort": effort.describe() if effort else None,
                                   **(gate.describe() if gate else {"live": None, "in_flight": 0, "waiting": 0,
                                                                    "flips": 0, "waited_s": 0.0, "broken": None})}
             return JSONResponse(answer)
