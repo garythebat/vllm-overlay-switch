@@ -30,8 +30,8 @@ Two things are checked, not assumed:
 Which set is active is read from the live weights, never remembered (the one exception: a
 rank on whose columns the two sets do not differ reports the set it wrote last).
 
-A full status also carries `derived`: one digest per rank of everything the model derived from
-these weights (the packed values, the two scale tables, the tiled copy where there is one).
+A full status (and only that: not the answer of a flip, which should stay short) also carries
+`derived`: one digest per rank of everything the model derived from these weights (the packed values, the two scale tables, the tiled copy where there is one).
 It can be read on a freshly started server, before anything was prepared or written. After a
 flip there and back it must be what it was, byte for byte: that is the exact form of "the
 model is restored", and it does not depend on comparing answers.
@@ -82,7 +82,7 @@ class OverlayWorkerExtension:
                     out["derived_error"] = _short(e)
             return out
         try:
-            out.update(_report(self, state, full=bool(full)))
+            out.update(_report(self, state, full=bool(full), derived=bool(full)))
         except Exception as e:
             out.update(ok=False, error=_short(e))
         return out
@@ -318,7 +318,7 @@ def _print(tensor) -> str:
     return hashlib.sha256(memoryview(tensor.contiguous().cpu().numpy())).hexdigest()
 
 
-def _report(worker, state: dict, *, full: bool, wrote: str | None = None) -> dict:
+def _report(worker, state: dict, *, full: bool, wrote: str | None = None, derived: bool = False) -> dict:
     """Compare live tensors with both sets. Probes are the first and last layer: a write goes
     through the layers in order, so one that stopped halfway leaves those two disagreeing."""
     attention = _attention_by_layer(worker)
@@ -340,7 +340,7 @@ def _report(worker, state: dict, *, full: bool, wrote: str | None = None) -> dic
            "sets": dict(state["ids"]),
            "error": None if ok else f"the live weights match neither set (base {match['base']}, "
                                     f"overlay {match['overlay']} of {len(keys)} tensors)"}
-    if full:
+    if derived:   # only a full status asks for it: inside a flip it would lengthen the pause for nothing
         out["derived"] = _derived_digest(worker, state["layers"])
     return out
 

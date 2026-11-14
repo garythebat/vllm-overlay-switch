@@ -386,10 +386,12 @@ class DerivedDigest(WorkerCase):
         fresh = worker.overlay_status(True)
         self.assertEqual((fresh["prepared"], fresh["active"]), (False, None))
         self.assertRegex(fresh["derived"], r"^[0-9a-f]{16}$")
-        # preparing writes nothing, so the digest is the one the startup left
-        self.assertEqual(worker.overlay_prepare()["derived"], fresh["derived"])
+        # preparing writes nothing, so the digest is the one the startup left; and neither a prepare
+        # nor a flip computes it: a flip holds generation paused and should not take longer for it
+        self.assertNotIn("derived", worker.overlay_prepare())
         self.assertNotIn("derived", worker.overlay_status())
         self.assertEqual(worker.overlay_status(True)["derived"], fresh["derived"])
+        self.assertNotIn("derived", worker.overlay_switch("overlay"))
 
     def test_there_and_back_gives_the_digest_of_the_start_on_every_rank(self):
         seen = set()
@@ -398,10 +400,12 @@ class DerivedDigest(WorkerCase):
                 worker = self.worker(rank)
                 start = worker.overlay_status(True)["derived"]
                 worker.overlay_prepare()
-                over = worker.overlay_switch("overlay")["derived"]
+                worker.overlay_switch("overlay")
+                over = worker.overlay_status(True)["derived"]
                 self.assertNotEqual(over, start)
-                self.assertEqual(worker.overlay_switch("base")["derived"], start)
-                self.assertEqual(worker.overlay_switch("overlay")["derived"], over)
+                worker.overlay_switch("base")
+                self.assertEqual(worker.overlay_status(True)["derived"], start)
+                worker.overlay_switch("overlay")
                 self.assertEqual(worker.overlay_status(True)["derived"], over)
                 seen.add(start)
         self.assertEqual(len(seen), RANKS)        # each rank holds other columns: digests are per rank
