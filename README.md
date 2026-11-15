@@ -141,21 +141,52 @@ Requirements:
   an index-remapped overlay folder points at. It must be readable at the same path inside
   the container on every node.
 
-With [spark-vllm-docker](https://github.com/eugr/spark-vllm-docker):
+### With pip
 
-1. Copy this repository's `mod/` folder into your checkout as `mods/overlay-switch`.
+Inside the environment that runs vLLM, on every node:
+
+```sh
+pip install git+https://github.com/garythebat/vllm-overlay-switch
+```
+
+The package has no dependencies of its own: it uses the torch, vLLM and kernels of the
+environment it is installed into. Then add three things to the launch:
+
+```sh
+export VLLM_PLUGINS=overlay_switch     # an allow-list: see below
+export OVERLAY_SWITCH_FILE=/path/to/side-file.safetensors
+vllm serve /path/to/base/checkpoint \
+    --worker-extension-cls vllm_overlay_switch.worker.OverlayWorkerExtension
+```
+
+`VLLM_PLUGINS` is an allow-list for all vLLM plugins, so it must also name the plugins
+your environment already loads. This prints the value to use:
+
+```sh
+python3 -c "from importlib.metadata import entry_points as e; print(','.join(dict.fromkeys(x.name for g in ('vllm.general_plugins', 'vllm.endpoint_plugins', 'vllm.io_processor_plugins', 'vllm.stat_logger_plugins', 'vllm.platform_plugins') for x in e(group=g))))"
+```
+
+pip installs the same files and the same entry point as the mod below, but it does not
+run the mod's checks against the engine (`mod/run.sh` verifies the hooks the gate relies
+on before the server starts). The test setup used the mod; the pip path has been checked
+in a clean Python environment and has not been launched inside an engine image. On any
+new setup, run the [acceptance tests](#verifying-a-deployment).
+
+### With spark-vllm-docker
+
+1. Copy this repository's `mod/` folder into your
+   [spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) checkout as
+   `mods/overlay-switch`.
 2. Add the four settings from [examples/recipe-additions.yaml](examples/recipe-additions.yaml)
    to your recipe: the mod, `VLLM_PLUGINS`, `OVERLAY_SWITCH_FILE` (the side file) and
    `--worker-extension-cls vllm_overlay_switch.worker.OverlayWorkerExtension`.
    Optional: `OVERLAY_GATE_PREFIX` enables the two endpoints, `OVERLAY_GATE_MODELS` maps
    a model name to the overlay, and the `OVERLAY_GATE_EFFORT_*` settings configure the
    `reasoning_effort` translation.
-3. Launch as usual. `VLLM_PLUGINS` is an allow-list for all vLLM plugins, so it must also
-   name the plugins your image already loads. The mod prints the exact value to use at
-   startup. To confirm that the worker extension loaded, look for this line in the server
+3. Launch as usual. The mod prints the exact `VLLM_PLUGINS` value to use at startup
+   (the variable is an allow-list, so it also names the plugins your image already
+   loads). To confirm that the worker extension loaded, look for this line in the server
    log: `Injected ... OverlayWorkerExtension ... for extended collective_rpc calls`.
-
-Without spark-vllm-docker, `pip install .` inside the image installs the same package.
 
 A complete example is in [examples/deepseek-v4.1-flash-1017/](examples/deepseek-v4.1-flash-1017/):
 the recipe, the model revisions and the file hashes of the test setup.
