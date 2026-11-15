@@ -207,9 +207,11 @@ request is admitted when its variant is active and no request for the other vari
 ahead of it. The request at the head of the queue may trigger a switch once nothing is
 in flight. A request stops being in flight when the app has finished with it, which for
 a streamed response is the end of the stream or the client disconnecting. In addition,
-the switch itself pauses in `wait` mode, which lets the engine run until idle before
-anything is copied, so a request the client has just abandoned is finished or aborted by
-then.
+the switch itself pauses in `wait` mode, which lets requests the engine is already
+running finish before anything is copied. Requests the engine has queued but not yet
+started are not waited for: while paused, the scheduler counts only running requests
+(`vllm/v1/core/sched/scheduler.py:3708-3718`) and starts no waiting ones (see Open
+questions).
 
 **Separate caches, no clearing.** A cached block is identified by a hash over its
 tokens, its parent's hash and a few extra keys. The request's `cache_salt` is one of
@@ -398,6 +400,11 @@ On the test setup:
 - A long generation on one variant while the other is requested: the wait is by design,
   but its length was not measured.
 - A client that disconnects while queued at the gate (it keeps its place).
+- Whether a request can stay queued inside the engine after its HTTP exchange has ended,
+  for example when a client disconnects while the request is being submitted. The
+  gate's `wait` pause would not drain it, and it would then run on the other variant
+  under its own cache salt. Switching with an `abort` pause once nothing is in flight
+  would remove the case; that change has not been made or tested.
 - Memory with long cached conversations on both variants at once: the test prompts are
   short.
 - The API-key check under the prefix on a real server, and a server with `--root-path`.
