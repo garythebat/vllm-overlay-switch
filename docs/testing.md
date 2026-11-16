@@ -88,3 +88,5 @@ leaves each node a few GiB free instead of six to eight.
   wait is by design, its length was not measured), long cached conversations on both
   variants at once (the test prompts are short), a client that disconnects while queued,
   and a server started with `--root-path`.
+- With two endpoints, the gate since its pause was changed from `wait` to `abort`: the
+  results on this page were measured before that change.

@@ -125,6 +125,8 @@ Not yet tested:
   wait is by design, its length was not measured), long cached conversations on both
   variants at once (the test prompts are short), a client that disconnects while queued,
   and a server started with `--root-path`
+- with two endpoints, the gate since its pause was changed from `wait` to `abort`: the
+  results above were measured before that change
 
 To check your own deployment, see [Verifying a deployment](#verifying-a-deployment). The
 unit-test coverage and the detailed measurements are in [docs/testing.md](docs/testing.md).
