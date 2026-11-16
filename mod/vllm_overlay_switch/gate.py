@@ -183,8 +183,12 @@ def gate_of(state) -> Gate:
             raise GateError("no engine on this server")
 
         async def flipper(variant: str, force: bool):
-            # no cache clear: each side's cached prefixes are kept apart by the salt the gate sets
-            return await flip(engine, variant, "wait", force, clear_cache=False)
+            # no cache clear: each side's cached prefixes are kept apart by the salt the gate sets.
+            # abort, not wait: the gate switches only when none of its own requests is in flight, so
+            # whatever the engine still holds belongs to a client that has gone. A wait pause lets such
+            # a request run on, and does not see one the scheduler has not started yet, which would
+            # then run after the switch on the other variant under its own variant's salt.
+            return await flip(engine, variant, "abort", force, clear_cache=False)
 
         gate = state.overlay_gate = Gate(flipper)
     return gate

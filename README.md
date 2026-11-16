@@ -453,11 +453,13 @@ purpose, 185 of 216 failed, 31 were inconclusive and none passed.
 - A client that disconnects while its request is queued at the gate keeps its place in
   the queue. When its turn comes the server switches for it, and the engine then drops
   the request, which wastes one switch.
-- The gate switches with a `wait` pause, which waits for requests the engine is running
-  but not for requests it has queued and not yet started. A request abandoned by its
-  client in that state and not aborted would run after the switch on the other variant
-  and store cache blocks under its own variant's salt. This has not been observed and is
-  not covered by the tests.
+- The gate switches with an `abort` pause. It switches only when none of its own
+  requests is in flight, so a request still inside the engine at that moment has been
+  abandoned by its client, and it is aborted before the weights change. One case remains:
+  a request abandoned while it is being submitted, which reaches the engine during the
+  switch itself, is queued and would run afterwards on the other variant and store cache
+  blocks under its own variant's salt. This has not been observed and is not covered by
+  the tests.
 - The gate requires a single API server process (`--api-server-count 1`, the default
   without data parallelism) and refuses to start otherwise, because its queue lives in
   one process.

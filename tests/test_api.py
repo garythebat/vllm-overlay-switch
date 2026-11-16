@@ -215,7 +215,8 @@ class Routes(unittest.TestCase):
         self.assertEqual((usual.headers["x-overlay-side"], usual.json()), ("base", {"salt": salt, "held": ["base"] * 3}))
         gate = c.get("/overlay/status").json()["gate"]
         self.assertEqual((gate["live"], gate["flips"], gate["in_flight"], gate["waiting"]), ("base", 2, 0, 0))
-        self.assertIn(("pause", "wait", False), self.engine.calls)
+        self.assertIn(("pause", "abort", False), self.engine.calls)
+        self.assertNotIn(("pause", "wait", False), self.engine.calls)
         self.assertNotIn(("reset_prefix_cache",), self.engine.calls)
         self.assertEqual(c.get("/free/overlay/status").status_code, 200)                 # a GET passes with the prefix taken off
         self.assertEqual(c.post("/free/v1/embeddings", json={}).status_code, 403)

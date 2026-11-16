@@ -211,8 +211,21 @@ class Order(GateCase):
         async def scenario():
             self.make()
             await call(self.mw, self.app_obj, FREE_CHAT, {"name": "f"})
-            self.assertIn(("pause", "wait", False), self.engine.calls)
+            self.assertIn(("pause", "abort", False), self.engine.calls)
             self.assertNotIn(("reset_prefix_cache",), self.engine.calls)
+        asyncio.run(scenario())
+
+    def test_every_gated_switch_pauses_with_abort(self):
+        # nothing of the gate's own is in flight when it switches, so what the engine still holds has
+        # no client; a wait pause would leave a request the scheduler has not started to run afterwards
+        async def scenario():
+            self.make()
+            for path in (FREE_CHAT, CHAT, FREE_CHAT):
+                await call(self.mw, self.app_obj, path, {"name": "x"})
+            await self.gate.force("base")
+            pauses = [c for c in self.engine.calls if c[0] == "pause"]
+            self.assertEqual(len(pauses), 4)
+            self.assertEqual(set(pauses), {("pause", "abort", False)})
         asyncio.run(scenario())
 
     def test_a_request_cut_off_while_it_runs_is_counted_out_at_once_and_the_other_side_gets_its_turn(self):
