@@ -76,6 +76,23 @@ leaves each node a few GiB free instead of six to eight.
 | State afterwards | Every tensor read back as base, with the startup digests, 60 switches into the launch |
 | Memory | The first two switches reduced free memory by 0.03 GiB. Over four minutes of switches and bursts the lowest reading on the tightest node was 1.89 GiB, against 1.7 GiB after its first requests and before any switch |
 
+### Repeated with an `abort` pause
+
+The results above were measured while the gate paused the engine in `wait` mode before
+a switch. It now pauses in `abort` mode (see
+[Limitations](../README.md#limitations)). The two-endpoint tests were repeated on that
+version, in the large configuration and with `--max-num-seqs 4` (the earlier runs used
+2).
+
+| Check | Result |
+|---|---|
+| Acceptance test | Passed: 156 responses each with the header of its own variant, 60 mixed responses all matching their own variant, separate prefix caches (256, 0, 256, 256 and 256 tokens reused, as before), 42 of 42 `reasoning_effort` requests returned 200 |
+| Timing | 0.66 s per response on average, 2.3 s when a switch was needed first. The gate counted 36 switches for the 36 alternating requests |
+| Client disconnecting mid-stream | Six rounds each way: after the client left, a request for the other variant was served in 2.4 to 2.8 s, by its own variant every time (12 of 12) |
+| Four concurrent requests for one variant | vLLM reported 4 requests running and 0 waiting. On base: 1,348 tokens in 14.9 s, 90 tokens/s in total. On the overlay, with a switch first: 1,272 tokens in 16.9 s, 75 tokens/s in total. Every response carried the header of the requested variant |
+| State afterwards | 60 switches into the launch, every tensor read back as base on every rank, and the digests of all derived state were those from startup, which were also those of the earlier launches |
+| Memory | The first two switches reduced free memory by 0.03 to 0.04 GiB. The lowest reading on the tightest node was 1.29 GiB, during the first switch, against 1.32 GiB after its first requests. Over five minutes of switches, bursts and concurrent requests it stayed between 1.63 and 1.89 GiB |
+
 ## Not yet tested
 
 - The manual switch under load (requests in flight, several clients).
@@ -88,5 +105,3 @@ leaves each node a few GiB free instead of six to eight.
   wait is by design, its length was not measured), long cached conversations on both
   variants at once (the test prompts are short), a client that disconnects while queued,
   and a server started with `--root-path`.
-- With two endpoints, the gate since its pause was changed from `wait` to `abort`: the
-  results on this page were measured before that change.

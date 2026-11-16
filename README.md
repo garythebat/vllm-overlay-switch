@@ -113,6 +113,22 @@ noted.
 | Lowest free memory during the tests, large configuration | 1.89 GiB on the tightest node |
 | For comparison: stop and relaunch to change variant | about 6 minutes |
 
+The two-endpoint rows above were measured while the gate paused the engine in `wait`
+mode. It now pauses in `abort` mode (see [Limitations](#limitations)), and the
+two-endpoint tests were repeated on that version, in the large configuration with
+`--max-num-seqs 4` (the earlier runs used 2):
+
+| Measurement | Result |
+|---|---|
+| Routing with two endpoints | 156 of 156 responses carried the header of the requested variant. 60 of 60 alternating and concurrent requests matched their own variant's reference outputs |
+| Response time | 0.66 s mean with no switch needed, 2.3 s mean when a switch was needed first |
+| Prefix cache with two endpoints | separate per variant, not cleared by a switch |
+| Client disconnecting mid-stream | the next request for the other variant was served in 2.4 to 2.8 s (12 of 12) |
+| `reasoning_effort` translation | 42 of 42 requests returned 200 |
+| Four concurrent requests for one variant | batched together: 90 tokens/s in total on the base, 75 tokens/s on the overlay including one switch |
+| State after 60 switches | every tensor read back as base, with the digests of a freshly started server |
+| Lowest free memory | 1.29 GiB on the tightest node at the first switch, 1.63 GiB during the tests |
+
 Not yet tested:
 
 - the manual switch under load (requests in flight, several clients)
@@ -125,8 +141,6 @@ Not yet tested:
   wait is by design, its length was not measured), long cached conversations on both
   variants at once (the test prompts are short), a client that disconnects while queued,
   and a server started with `--root-path`
-- with two endpoints, the gate since its pause was changed from `wait` to `abort`: the
-  results above were measured before that change
 
 To check your own deployment, see [Verifying a deployment](#verifying-a-deployment). The
 unit-test coverage and the detailed measurements are in [docs/testing.md](docs/testing.md).
